@@ -41,17 +41,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-from .config import (
-    ENABLE_LOCAL_FALLBACK,
-    GEMINI_MODEL,
-    OLLAMA_HOST,
-    OLLAMA_MODEL,
-    REQUEST_TIMEOUT_SECONDS,
-    RETRY_ATTEMPTS,
-    RETRY_BASE_DELAY,
-    RETRY_MAX_DELAY,
-    require_api_key,
-)
+from . import config
 from .errors import TutorError
 from .progress import status, step
 
@@ -94,9 +84,10 @@ def get_client() -> genai.Client:
     if _client is None:
         # An explicit timeout (the SDK takes milliseconds) so a stalled request
         # fails and gets retried instead of hanging the notebook forever.
+        config.validate_models()
         from .embeddings import build_http_options  # shared timeout + retry policy
 
-        _client = genai.Client(api_key=require_api_key(), http_options=build_http_options())
+        _client = genai.Client(api_key=config.require_api_key(), http_options=build_http_options())
     return _client
 
 
@@ -148,10 +139,10 @@ def _backoff_delay(attempt: int) -> float:
     Note the google-genai SDK already retries internally at the HTTP level. This
     layer sits on top of that and is what handles a spike the SDK gives up on.
     """
-    delay = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
-    # Clamp after jittering, so RETRY_MAX_DELAY is a real ceiling and not a
+    delay = min(config.RETRY_BASE_DELAY * (2**attempt), config.RETRY_MAX_DELAY)
+    # Clamp after jittering, so config.RETRY_MAX_DELAY is a real ceiling and not a
     # suggestion the jitter can exceed by 25%.
-    return min(delay * random.uniform(0.75, 1.25), RETRY_MAX_DELAY)
+    return min(delay * random.uniform(0.75, 1.25), config.RETRY_MAX_DELAY)
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +151,7 @@ def _backoff_delay(attempt: int) -> float:
 
 
 def _call_gemini(prompt: str, system: str | None, schema: Type[BaseModel] | None, temperature: float) -> str:
-    config = types.GenerateContentConfig(
+    request_config = types.GenerateContentConfig(
         system_instruction=system,
         temperature=temperature,
         # Forcing the schema at the API level is stricter than asking for JSON in
@@ -170,7 +161,9 @@ def _call_gemini(prompt: str, system: str | None, schema: Type[BaseModel] | None
         response_schema=schema,
     )
     client = get_client()
-    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+    response = client.models.generate_content(
+        model=config.GEMINI_MODEL, contents=prompt, config=request_config
+    )
     if not response.text:
         raise LLMError(f"Gemini returned no text (finish reason: {response.candidates[0].finish_reason}).")
     return response.text
@@ -183,7 +176,7 @@ def _call_ollama(prompt: str, system: str | None, schema: Type[BaseModel] | None
     messages.append({"role": "user", "content": prompt})
 
     payload: dict = {
-        "model": OLLAMA_MODEL,
+        "model": config.OLLAMA_MODEL,
         "messages": messages,
         "stream": False,
         "think": False,  # ask Qwen3 to skip its reasoning block
@@ -194,7 +187,7 @@ def _call_ollama(prompt: str, system: str | None, schema: Type[BaseModel] | None
         # model drives both providers.
         payload["format"] = schema.model_json_schema()
 
-    response = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+    response = requests.post(f"{config.OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
     response.raise_for_status()
     content = response.json()["message"]["content"]
     # Belt and braces: older Ollama builds ignore "think", so strip the block anyway.
@@ -219,48 +212,60 @@ def generate(
     grounded in a source text, and grades answers. All three want faithfulness,
     not creativity.
 
-    allow_fallback=None means "use the project setting" (ENABLE_LOCAL_FALLBACK).
+    allow_fallback=None means "use the project setting" (config.ENABLE_LOCAL_FALLBACK).
     """
+    # Validated here, not only inside get_client(): the client is a cached singleton,
+    # so once it exists the check inside it never runs again. A guard that only fires
+    # on the first call is a guard you cannot rely on.
+    config.validate_models()
+
     if allow_fallback is None:
-        allow_fallback = ENABLE_LOCAL_FALLBACK
+        allow_fallback = config.ENABLE_LOCAL_FALLBACK
 
     last_error: Exception | None = None
 
-    for attempt in range(RETRY_ATTEMPTS):
+    for attempt in range(config.RETRY_ATTEMPTS):
         try:
-            label = f"{GEMINI_MODEL}" + (f" (attempt {attempt + 1}/{RETRY_ATTEMPTS})" if attempt else "")
+            label = f"{config.GEMINI_MODEL}" + (f" (attempt {attempt + 1}/{config.RETRY_ATTEMPTS})" if attempt else "")
             with step(label):
                 text = _call_gemini(prompt, system, schema, temperature)
-            return LLMResponse(text, "gemini", GEMINI_MODEL)
+            return LLMResponse(text, "gemini", config.GEMINI_MODEL)
         except Exception as error:  # noqa: BLE001
             last_error = error
             if _is_rate_limit(error):
                 break  # retrying cannot create quota
             if _is_transient(error):
-                if attempt < RETRY_ATTEMPTS - 1:
+                if attempt < config.RETRY_ATTEMPTS - 1:
                     wait = _backoff_delay(attempt)
                     status(
                         f"     Gemini busy ({_short(error)}) - "
-                        f"retry {attempt + 1}/{RETRY_ATTEMPTS - 1} in {wait:.1f}s"
+                        f"retry {attempt + 1}/{config.RETRY_ATTEMPTS - 1} in {wait:.1f}s"
                     )
                     time.sleep(wait)
                     continue
                 break  # patience spent; the provider is down, not our code
-            raise  # a real bug: schema error, bad argument, missing key. Do not hide it.
+            code = getattr(error, "code", None)
+            if isinstance(code, int) and 400 <= code < 500:
+                # A 4xx is our fault (wrong model, bad schema, dead key), so we still
+                # stop rather than fall back - but the API's own message is the most
+                # useful thing on screen, and re-raising raw buries it under 40 lines
+                # of SDK traceback. Wrap it so the diagnosis is the first thing read.
+                raise LLMError(_explain(error)) from error
+            raise  # a real bug in our code: TypeError, ValueError. Do not dress it up.
 
     if not allow_fallback:
         raise LLMError(_explain(last_error)) from last_error
 
-    status(f"  [fallback] Gemini unusable -> {OLLAMA_MODEL} via Ollama")
+    status(f"  [fallback] Gemini unusable -> {config.OLLAMA_MODEL} via Ollama")
     try:
-        with step(f"{OLLAMA_MODEL} (local, this is slower)"):
+        with step(f"{config.OLLAMA_MODEL} (local, this is slower)"):
             text = _call_ollama(prompt, system, schema, temperature)
-        return LLMResponse(text, "ollama", OLLAMA_MODEL)
+        return LLMResponse(text, "ollama", config.OLLAMA_MODEL)
     except requests.exceptions.RequestException as error:
         raise LLMError(
             f"{_explain(last_error)}\n\n"
-            f"The local fallback is enabled but Ollama is unreachable at {OLLAMA_HOST}.\n"
-            f"Start it with `ollama serve`, or set ENABLE_LOCAL_FALLBACK=false in .env."
+            f"The local fallback is enabled but Ollama is unreachable at {config.OLLAMA_HOST}.\n"
+            f"Start it with `ollama serve`, or set config.ENABLE_LOCAL_FALLBACK=false in .env."
         ) from error
 
 
@@ -278,32 +283,53 @@ def _explain(error: Exception | None) -> str:
     """
     if error is None:
         return "Gemini failed for an unknown reason."
+    code = getattr(error, "code", None)
+    if isinstance(code, int) and 400 <= code < 500 and code != 429:
+        # Google's own message usually names the fix ("use models/gemini-3.6-flash"),
+        # so it goes first and unabridged. Ours only adds what it cannot know.
+        return (
+            f"Gemini rejected the request with {code} using GEMINI_MODEL={config.GEMINI_MODEL}.\n\n"
+            f"What the API said:\n  {error}\n\n"
+            f"If the message names a replacement model, put that name in .env. Beware that a\n"
+            f"model can exist and still 404 for you: older ones are closed to new API keys.\n"
+            f"`python scripts/bench.py` times every candidate against YOUR key, which is the\n"
+            f"only list that matters."
+        )
     if isinstance(error, _TRANSIENT_TYPES) and not getattr(error, "code", None):
         return (
-            f"Gemini did not answer within {REQUEST_TIMEOUT_SECONDS:.0f}s per attempt, "
-            f"{RETRY_ATTEMPTS} times over ({GEMINI_MODEL}).\n"
+            f"Gemini did not answer within {config.REQUEST_TIMEOUT_SECONDS:.0f}s per attempt, "
+            f"{config.RETRY_ATTEMPTS} times over ({config.GEMINI_MODEL}).\n"
             f"The '-latest' aliases hot-swap to the newest model, which is also the most "
             f"contended one. Pin a stable build in .env instead:\n"
             f"    GEMINI_MODEL=gemini-2.5-flash\n"
             f"Run `python scripts/bench.py` to see which models actually respond on your key.\n"
             f"Original error: {type(error).__name__}: {error}"
         )
+    if getattr(error, "code", None) == 404:
+        return (
+            f"Gemini says '{config.GEMINI_MODEL}' does not exist or cannot generate text.\n"
+            f"Check config.GEMINI_MODEL in .env - a 404 here usually means an embedding model or a\n"
+            f"retired model name. Current stable options include gemini-2.5-flash,\n"
+            f"gemini-3.5-flash and gemini-3.7-flash. `python scripts/bench.py` lists what\n"
+            f"your key can actually reach.\n"
+            f"Original error: {error}"
+        )
     if _is_rate_limit(error):
         return (
-            f"Gemini rate limit reached ({GEMINI_MODEL}). This is quota, not a bug in your code.\n"
-            f"Wait about a minute, or enable the local fallback with ENABLE_LOCAL_FALLBACK=true in .env.\n"
+            f"Gemini rate limit reached ({config.GEMINI_MODEL}). This is quota, not a bug in your code.\n"
+            f"Wait about a minute, or enable the local fallback with config.ENABLE_LOCAL_FALLBACK=true in .env.\n"
             f"Original error: {error}"
         )
     return (
-        f"Gemini is still unavailable after {RETRY_ATTEMPTS} attempts spread over "
-        f"~{int(sum(min(RETRY_BASE_DELAY * 2**i, RETRY_MAX_DELAY) for i in range(RETRY_ATTEMPTS - 1)))}s "
-        f"({GEMINI_MODEL}).\n"
+        f"Gemini is still unavailable after {config.RETRY_ATTEMPTS} attempts spread over "
+        f"~{int(sum(min(config.RETRY_BASE_DELAY * 2**i, config.RETRY_MAX_DELAY) for i in range(config.RETRY_ATTEMPTS - 1)))}s "
+        f"({config.GEMINI_MODEL}).\n"
         f"A 503 means the shared model is overloaded on Google's side - nothing is wrong with "
         f"your key or your code. Options:\n"
         f"  1. Re-run the cell in a minute; these spikes are usually short.\n"
-        f"  2. Pin a specific model in .env, e.g. GEMINI_MODEL=gemini-2.5-flash, instead of the\n"
+        f"  2. Pin a specific model in .env, e.g. config.GEMINI_MODEL=gemini-2.5-flash, instead of the\n"
         f"     'latest' alias, which points at whichever build is busiest.\n"
-        f"  3. Set ENABLE_LOCAL_FALLBACK=true to answer from Ollama instead.\n"
+        f"  3. Set config.ENABLE_LOCAL_FALLBACK=true to answer from Ollama instead.\n"
         f"Original error: {error}"
     )
 
@@ -311,8 +337,8 @@ def _explain(error: Exception | None) -> str:
 def ollama_available() -> bool:
     """Used by the notebook to report honestly whether the fallback is armed."""
     try:
-        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        response = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
         models = [m["name"] for m in response.json().get("models", [])]
-        return any(m.split(":")[0] == OLLAMA_MODEL.split(":")[0] for m in models)
+        return any(m.split(":")[0] == config.OLLAMA_MODEL.split(":")[0] for m in models)
     except Exception:  # noqa: BLE001
         return False

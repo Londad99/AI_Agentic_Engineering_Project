@@ -102,6 +102,71 @@ def test_timeout_message_suggests_pinning():
         raise AssertionError("expected LLMError after repeated timeouts")
 
 
+def test_model_variables_are_validated():
+    """The mistake that produced a 404: an embedding model in the chat variable.
+
+    Gemini's own error ("is not found for API version v1beta, or is not supported
+    for generateContent") reads like a missing model, which sends you hunting for
+    model names instead of looking at which variable holds them. Catching it before
+    the call turns an hour of confusion into one sentence.
+    """
+    from tutor import config
+    from tutor.errors import ConfigError
+
+    original_chat, original_embed = config.GEMINI_MODEL, config.GEMINI_EMBED_MODEL
+    try:
+        config.GEMINI_MODEL = "gemini-embedding-001"
+        try:
+            config.validate_models()
+        except ConfigError as error:
+            assert "embedding model" in str(error)
+            assert "GEMINI_MODEL=gemini-2.5-flash" in str(error), "does not name the fix"
+        else:
+            raise AssertionError("an embedding model in GEMINI_MODEL was accepted")
+
+        config.GEMINI_MODEL = "gemini-2.5-flash"
+        config.GEMINI_EMBED_MODEL = "gemini-2.5-flash"
+        try:
+            config.validate_models()
+        except ConfigError as error:
+            assert "does not look like" in str(error)
+        else:
+            raise AssertionError("a chat model in GEMINI_EMBED_MODEL was accepted")
+
+        config.GEMINI_EMBED_MODEL = "gemini-embedding-001"
+        config.validate_models()  # the correct pairing must pass
+        print("model vars validated  OK")
+    finally:
+        config.GEMINI_MODEL, config.GEMINI_EMBED_MODEL = original_chat, original_embed
+
+
+def test_api_4xx_is_wrapped_not_buried():
+    """A 404 must stop the run, but readably.
+
+    This is what happened with gemini-2.5-flash: Google answered
+    "no longer available to new users, use models/gemini-3.6-flash" - the exact fix,
+    in the exception - and our code re-raised it raw, burying that sentence under
+    forty lines of SDK traceback. A 4xx is still our fault and still must not fall
+    back, but the API's own message deserves to be the first thing on screen.
+    """
+
+    class NotFound(Exception):
+        code = 404
+
+    def gemini(*a):
+        raise NotFound("This model is no longer available, use models/gemini-3.6-flash")
+
+    llm._call_gemini = gemini
+    try:
+        llm.generate("prompt", allow_fallback=True)  # must NOT fall back on a 4xx
+    except llm.LLMError as error:
+        assert "gemini-3.6-flash" in str(error), "the API's own guidance was dropped"
+        assert "GEMINI_MODEL=" in str(error), "does not point at the setting to change"
+        print("4xx wrapped           OK")
+    else:
+        raise AssertionError("a 404 was answered by the fallback model")
+
+
 def test_real_bug_is_not_hidden():
     def gemini(*a):
         raise TypeError("bad argument to generate_content")
@@ -151,10 +216,10 @@ def test_retry_schedule():
     except llm.LLMError:
         pass
 
-    assert len(attempts) == llm.RETRY_ATTEMPTS, f"tried {len(attempts)}, expected {llm.RETRY_ATTEMPTS}"
-    assert len(waits) == llm.RETRY_ATTEMPTS - 1, "one wait between each pair of attempts"
+    assert len(attempts) == llm.config.RETRY_ATTEMPTS, f"tried {len(attempts)}, expected {llm.config.RETRY_ATTEMPTS}"
+    assert len(waits) == llm.config.RETRY_ATTEMPTS - 1, "one wait between each pair of attempts"
     assert waits[0] < waits[-1], "backoff is not growing"
-    assert max(waits) <= llm.RETRY_MAX_DELAY, "a wait exceeded RETRY_MAX_DELAY - the cap is not a cap"
+    assert max(waits) <= llm.config.RETRY_MAX_DELAY, "a wait exceeded RETRY_MAX_DELAY - the cap is not a cap"
     assert len(set(waits)) == len(waits), "waits are identical - jitter is not applied"
     print(f"retry schedule        OK ({len(attempts)} tries, {sum(waits):.0f}s total patience)")
 
@@ -234,6 +299,8 @@ def test_think_block_is_stripped():
 if __name__ == "__main__":
     test_happy_path()
     test_rate_limit_falls_back()
+    test_model_variables_are_validated()
+    test_api_4xx_is_wrapped_not_buried()
     test_real_bug_is_not_hidden()
     test_httpx_timeout_is_transient()
     test_timeout_message_suggests_pinning()

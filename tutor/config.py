@@ -41,10 +41,16 @@ load_dotenv(ENV_FILE)
 # An empty string or a leftover placeholder must count as "not set", otherwise the
 # failure surfaces later as an opaque 400 from the API instead of a clear message here.
 _PLACEHOLDERS = {"", "your_key_here", "your_key_from_aistudio.google.com"}
-_raw_key = (os.environ.get("GOOGLE_API_KEY") or "").strip()
-GOOGLE_API_KEY = None if _raw_key in _PLACEHOLDERS else _raw_key
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+
+def _read_api_key() -> str | None:
+    raw = (os.environ.get("GOOGLE_API_KEY") or "").strip()
+    return None if raw in _PLACEHOLDERS else raw
+
+
+GOOGLE_API_KEY = _read_api_key()
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_EMBED_MODEL = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 
 # gemini-embedding-001 natively outputs 3072 dims. 768 keeps quality while cutting
@@ -84,6 +90,79 @@ ENABLE_LOCAL_FALLBACK = os.environ.get("ENABLE_LOCAL_FALLBACK", "false").strip()
 
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+
+def reload() -> dict:
+    """Re-read .env into this module, without restarting the Python process.
+
+    Needed because a Jupyter kernel outlives every edit you make to .env. Modules
+    are imported once and their globals keep whatever the file said at that moment,
+    so changing a setting appears to do nothing - the single most confusing failure
+    mode when configuring this project.
+
+    override=True matters: load_dotenv defaults to not overwriting variables that
+    already exist in the environment, which is exactly the case on a second call.
+    """
+    load_dotenv(ENV_FILE, override=True)
+    module = globals()
+    module["GOOGLE_API_KEY"] = _read_api_key()
+    module["GEMINI_MODEL"] = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+    module["GEMINI_EMBED_MODEL"] = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+    module["EMBED_DIM"] = int(os.environ.get("EMBED_DIM", "768"))
+    module["EMBED_BATCH_SIZE"] = int(os.environ.get("EMBED_BATCH_SIZE", "100"))
+    module["CHUNK_SIZE"] = int(os.environ.get("CHUNK_SIZE", "1200"))
+    module["CHUNK_OVERLAP"] = int(os.environ.get("CHUNK_OVERLAP", "200"))
+    module["REQUEST_TIMEOUT_SECONDS"] = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60"))
+    module["RETRY_ATTEMPTS"] = int(os.environ.get("RETRY_ATTEMPTS", "5"))
+    module["RETRY_BASE_DELAY"] = float(os.environ.get("RETRY_BASE_DELAY", "2"))
+    module["RETRY_MAX_DELAY"] = float(os.environ.get("RETRY_MAX_DELAY", "16"))
+    module["ENABLE_LOCAL_FALLBACK"] = os.environ.get(
+        "ENABLE_LOCAL_FALLBACK", "false"
+    ).strip().lower() in {"1", "true", "yes"}
+    module["OLLAMA_MODEL"] = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+    module["OLLAMA_HOST"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+    # The clients cache the API key and timeout, so they must be rebuilt too.
+    from . import embeddings, llm
+
+    embeddings._client = None
+    llm._client = None
+
+    return {
+        "GEMINI_MODEL": GEMINI_MODEL,
+        "GEMINI_EMBED_MODEL": GEMINI_EMBED_MODEL,
+        "EMBED_DIM": EMBED_DIM,
+        "ENABLE_LOCAL_FALLBACK": ENABLE_LOCAL_FALLBACK,
+    }
+
+
+def validate_models() -> None:
+    """Catch model names put in the wrong variable, before the API does.
+
+    Gemini has two model families that do not overlap: generative models answer
+    generateContent, embedding models answer embedContent. Swapping them returns a
+    404 whose message ("is not found for API version v1beta, or is not supported
+    for generateContent") reads like the model does not exist, which sends you
+    hunting for the right model name instead of looking at the variable it is in.
+
+    Cheap to check, and it turns a confusing 404 into a sentence that names the fix.
+    """
+    from .errors import ConfigError
+
+    if "embedding" in GEMINI_MODEL.lower():
+        raise ConfigError(
+            f"GEMINI_MODEL is set to '{GEMINI_MODEL}', which is an embedding model.\n"
+            f"It cannot generate text - embedding models have no generateContent method.\n"
+            f"Set a generative model in {ENV_FILE}, for example:\n"
+            f"    GEMINI_MODEL=gemini-2.5-flash\n"
+            f"    GEMINI_EMBED_MODEL={GEMINI_EMBED_MODEL}   (this one is correct)"
+        )
+    if "embedding" not in GEMINI_EMBED_MODEL.lower():
+        raise ConfigError(
+            f"GEMINI_EMBED_MODEL is set to '{GEMINI_EMBED_MODEL}', which does not look like\n"
+            f"an embedding model. Expected something like gemini-embedding-001 or\n"
+            f"gemini-embedding-2. Fix it in {ENV_FILE}."
+        )
 
 
 def require_api_key() -> str:

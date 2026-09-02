@@ -15,3 +15,7 @@ class TutorError(Exception):
 
 class IngestionError(TutorError):
     """No usable text could be extracted from the given path."""
+
+
+class ConfigError(TutorError):
+    """A setting in .env is wrong in a way we can detect before calling the API."""
