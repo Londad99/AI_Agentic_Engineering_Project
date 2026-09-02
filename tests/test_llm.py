@@ -1,0 +1,247 @@
+"""Tests for the provider routing policy in tutor/llm.py.
+
+These make no network calls: the two provider functions are replaced with fakes,
+so what is under test is the decision logic — when to retry, when to fall back,
+and when to refuse to fall back.
+
+That last one is the point of the file. A fallback that triggers on *any* error
+is worse than no fallback: a bug in our prompt or schema would quietly produce a
+degraded answer from the local model instead of a stack trace, and we would ship
+it without noticing.
+
+Run:  python tests/test_llm.py
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import requests  # noqa: E402
+
+from tutor import llm, progress  # noqa: E402
+
+progress.VERBOSE = False  # keep the test output to one line per test
+
+
+class FakeRateLimit(Exception):
+    code = 429
+
+
+class FakeServerError(Exception):
+    code = 503
+
+
+def run(gemini, ollama=lambda *a: "local answer", **kwargs):
+    """Swap both providers for fakes and call generate().
+
+    The fallback is off by default in config while the project is being built, so
+    the tests that exercise it pass allow_fallback explicitly.
+    """
+    llm._call_gemini, llm._call_ollama = gemini, ollama
+    llm.time.sleep = lambda _s: None  # never actually wait in tests
+    return llm.generate("prompt", **kwargs)
+
+
+def test_happy_path():
+    response = run(lambda *a: "gemini answer")
+    assert response.provider == "gemini" and response.text == "gemini answer"
+    print("happy path            OK")
+
+
+def test_rate_limit_falls_back():
+    calls = []
+
+    def gemini(*a):
+        calls.append(1)
+        raise FakeRateLimit("429 RESOURCE_EXHAUSTED")
+
+    response = run(gemini, allow_fallback=True)
+    assert response.provider == "ollama", "did not fall back on a rate limit"
+    assert len(calls) == 1, "retried a rate limit instead of going local immediately"
+    print("rate limit -> ollama  OK")
+
+
+def test_httpx_timeout_is_transient():
+    """The regression that broke the structured-output cell.
+
+    Gemini's SDK raises httpx exceptions, not requests ones. The first version of
+    _is_transient only knew about requests, so an httpx.ReadTimeout - the single
+    most common Gemini failure - was classified as a bug in our code and re-raised,
+    after the retry loop had already correctly survived two 503s.
+    """
+    import httpx
+
+    for error in (
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectTimeout("timed out"),
+        httpx.ConnectError("refused"),
+        TimeoutError("timed out"),
+    ):
+        assert llm._is_transient(error), f"{type(error).__name__} would not be retried"
+
+    assert not llm._is_transient(TypeError("bad argument")), "a code bug looks transient"
+    assert not llm._is_transient(ValueError("bad schema")), "a code bug looks transient"
+    print("httpx timeout retried OK")
+
+
+def test_timeout_message_suggests_pinning():
+    import httpx
+
+    def gemini(*a):
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    llm._call_gemini = gemini
+    llm.time.sleep = lambda _s: None
+    try:
+        llm.generate("prompt", allow_fallback=False)
+    except llm.LLMError as error:
+        assert "GEMINI_MODEL=" in str(error), "does not suggest pinning a stable model"
+        print("timeout guidance      OK")
+    else:
+        raise AssertionError("expected LLMError after repeated timeouts")
+
+
+def test_real_bug_is_not_hidden():
+    def gemini(*a):
+        raise TypeError("bad argument to generate_content")
+
+    llm._call_gemini, llm._call_ollama = gemini, lambda *a: "local answer"
+    try:
+        llm.generate("prompt")
+    except TypeError:
+        print("bug re-raised         OK")
+    else:
+        raise AssertionError("a code bug was silently answered by the fallback model")
+
+
+def test_transient_error_retries_same_provider():
+    attempts = []
+
+    def gemini(*a):
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise FakeServerError("503 unavailable")
+        return "gemini answer after retry"
+
+    response = run(gemini)
+    assert response.provider == "gemini" and len(attempts) == 2, attempts
+    print("transient retry       OK")
+
+
+def test_retry_schedule():
+    """A 503 spike must be waited out, not given up on after two seconds.
+
+    Checks the shape of the backoff rather than exact numbers: as many attempts as
+    configured, waits that grow, and a cap so the last one cannot balloon.
+    """
+    waits = []
+    attempts = []
+
+    def gemini(*a):
+        attempts.append(1)
+        raise FakeServerError("503 UNAVAILABLE")
+
+    llm._call_gemini = gemini
+    llm._call_ollama = lambda *a: "local answer"
+    llm.time.sleep = waits.append
+
+    try:
+        llm.generate("prompt", allow_fallback=False)
+    except llm.LLMError:
+        pass
+
+    assert len(attempts) == llm.RETRY_ATTEMPTS, f"tried {len(attempts)}, expected {llm.RETRY_ATTEMPTS}"
+    assert len(waits) == llm.RETRY_ATTEMPTS - 1, "one wait between each pair of attempts"
+    assert waits[0] < waits[-1], "backoff is not growing"
+    assert max(waits) <= llm.RETRY_MAX_DELAY, "a wait exceeded RETRY_MAX_DELAY - the cap is not a cap"
+    assert len(set(waits)) == len(waits), "waits are identical - jitter is not applied"
+    print(f"retry schedule        OK ({len(attempts)} tries, {sum(waits):.0f}s total patience)")
+
+
+def test_exhausted_retries_fall_back():
+    """A 503 that never clears means the provider is down, not that we have a bug.
+
+    This is the case that actually happened during development: Gemini answered
+    503 UNAVAILABLE ("high demand") three times in a row. The first version of
+    generate() re-raised it and never reached the fallback, contradicting its own
+    docstring. This test exists so that cannot regress.
+    """
+
+    def gemini(*a):
+        raise FakeServerError("503 UNAVAILABLE")
+
+    response = run(gemini, allow_fallback=True)
+    assert response.provider == "ollama", "gave up instead of falling back after retries"
+    print("503 exhausted -> local OK")
+
+
+def test_outage_message_is_actionable():
+    """With the fallback off, the user must learn it is Google's fault, not theirs."""
+
+    def gemini(*a):
+        raise FakeServerError("503 UNAVAILABLE")
+
+    llm._call_gemini = gemini
+    llm.time.sleep = lambda _s: None
+    try:
+        llm.generate("prompt", allow_fallback=False)
+    except llm.LLMError as error:
+        message = str(error)
+        assert "overloaded on Google" in message, "does not say whose fault it is"
+        assert "GEMINI_MODEL=" in message, "does not offer the pin-a-model workaround"
+        print("outage message        OK")
+    else:
+        raise AssertionError("expected LLMError when Gemini is down and fallback is off")
+
+
+def test_fallback_can_be_disabled():
+    def gemini(*a):
+        raise FakeRateLimit("429")
+
+    llm._call_gemini = gemini
+    try:
+        llm.generate("prompt", allow_fallback=False)
+    except llm.LLMError:
+        print("allow_fallback=False  OK")
+    else:
+        raise AssertionError("fell back even though allow_fallback was False")
+
+
+def test_unreachable_ollama_message():
+    def gemini(*a):
+        raise FakeRateLimit("429")
+
+    def ollama(*a):
+        raise requests.exceptions.ConnectionError("refused")
+
+    llm._call_gemini, llm._call_ollama = gemini, ollama
+    try:
+        llm.generate("prompt", allow_fallback=True)
+    except llm.LLMError as error:
+        assert "ollama serve" in str(error), "error does not tell the user how to fix it"
+        print("both down -> guidance OK")
+    else:
+        raise AssertionError("expected LLMError when both providers fail")
+
+
+def test_think_block_is_stripped():
+    dirty = "<think>the user wants a topic list, let me...</think>\n{\"ok\": true}"
+    assert llm.THINK_BLOCK_RE.sub("", dirty).strip() == '{"ok": true}'
+    print("think block stripped  OK")
+
+
+if __name__ == "__main__":
+    test_happy_path()
+    test_rate_limit_falls_back()
+    test_real_bug_is_not_hidden()
+    test_httpx_timeout_is_transient()
+    test_timeout_message_suggests_pinning()
+    test_transient_error_retries_same_provider()
+    test_retry_schedule()
+    test_exhausted_retries_fall_back()
+    test_outage_message_is_actionable()
+    test_fallback_can_be_disabled()
+    test_unreachable_ollama_message()
+    test_think_block_is_stripped()
+    print("\nall llm routing tests passed")
