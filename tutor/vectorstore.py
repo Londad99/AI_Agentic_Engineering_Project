@@ -49,6 +49,32 @@ def add_chunks(chunks: list[Chunk], collection=None) -> int:
     return len(chunks)
 
 
+def list_all_chunks(collection=None) -> list[dict]:
+    """Every chunk, in document order.
+
+    Deliberately not a search. "What topics does this document cover?" is not a
+    similarity question: embedding that sentence and taking the top 5 returns the
+    passages that most resemble the phrase "what topics does this cover", which is
+    close to meaningless. Topic extraction needs coverage of the whole document, so
+    it reads everything.
+
+    Document order (page, then position on the page) matters too: a topic explained
+    across two consecutive chunks is obvious in sequence and invisible in the
+    arbitrary order the store happens to return.
+    """
+    collection = collection or get_collection()
+    if collection.count() == 0:
+        return []
+    result = collection.get(include=["documents", "metadatas"])
+    chunks = [
+        {"text": text, "metadata": metadata}
+        for text, metadata in zip(result["documents"], result["metadatas"])
+    ]
+    chunks.sort(key=lambda c: (c["metadata"].get("source", ""), c["metadata"].get("page", 0),
+                               c["metadata"].get("chunk_index", 0)))
+    return chunks
+
+
 def search(query: str, top_k: int = 5, threshold: float | None = None, collection=None) -> list[dict]:
     """Semantic search. Same idea as the week-3 notebook, backed by a real vector DB.
 

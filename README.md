@@ -22,7 +22,8 @@ interesting to read cell by cell, so it lives in modules where it can be unit-te
 
 ```
 notebooks/tutor.ipynb   the project: agents, orchestrator, demo
-tutor/config.py         all settings, read from .env
+tutor/config.py         all settings, read from .env (config.reload() re-reads it)
+tutor/prompts.py        loads prompts/*.txt and composes persona + role
 tutor/llm.py            single entry point for LLM calls, with retry/fallback policy
 tutor/embedding_cache.py  on-disk cache so an embedding is never paid for twice
 tutor/progress.py       progress output that survives Jupyter's stdout buffering
@@ -32,7 +33,10 @@ tutor/ingest/           pdf_loader -> cleaner -> chunker -> pipeline
 tests/test_ingest.py    offline tests for cleaning and chunking
 tests/test_llm.py       offline tests for the provider routing policy
 tests/test_cache.py     offline tests for the embedding cache
+tests/test_prompts.py   the shared persona reaches every agent
+tests/test_notebook_refs.py  notebook cells reference attributes that exist
 scripts/                CLI entry points: ingest.py, search.py, diagnose.py
+prompts/system_prompt.txt  the tutor's persona, scope and refusal rules
 data/                   put your PDFs here (git-ignored)
 storage/                ChromaDB files (git-ignored)
 ```
@@ -75,7 +79,7 @@ Three retrieval decisions carry most of the quality:
 
 - [x] Ingestion pipeline + vector store + tests
 - [x] LLM provider with local fallback (Gemini -> Qwen/Ollama on rate limit)
-- [ ] Topic Extractor agent
+- [x] Topic Extractor agent (map-reduce over the whole document)
 - [ ] Exam Generator agent
 - [ ] Grader agent
 - [ ] Orchestrator + conversation memory
