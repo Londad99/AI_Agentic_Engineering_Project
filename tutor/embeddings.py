@@ -96,6 +96,7 @@ def _call_ollama_embed(texts: list[str]) -> list[list[float]]:
 
 
 def _embed_batch(texts: list[str], task_type: str) -> list[list[float]]:
+    config.reload_if_changed()
     config.validate_models()  # cheap, and the cached client would otherwise skip the check
     if config.EMBED_PROVIDER == "ollama":
         return _call_ollama_embed(texts)

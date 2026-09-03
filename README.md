@@ -9,9 +9,11 @@ practice exams grounded in the text, and grades written answers point by point.
 Built with **context engineering + RAG**, the **Gemini API** and **ChromaDB**, on a
 **sub-agent architecture**.
 
-**The deliverable is [`notebooks/tutor.ipynb`](notebooks/tutor.ipynb)** — open it
-first. It holds the agents, their prompts and their schemas, committed with outputs so
-it can be read on GitHub without running anything.
+**Start with [`notebooks/tutor.ipynb`](notebooks/tutor.ipynb)** — it walks through the
+whole system with its output committed, so it can be read on GitHub without running
+anything. The agents themselves live in `tutor/`, so the notebook and the chat program
+(`scripts/chat.py`) and the web app (`app.py`) are front ends over the same tested
+code.
 
 ---
 
@@ -27,8 +29,14 @@ Python 3.10 or newer, and a Gemini API key from
 ```bash
 git clone <this-repo-url>
 cd AI_Agentic_Engineering_Project
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+> **On Windows, prefer `python -m <tool>` over the bare command.** Python installers
+> frequently leave their `Scripts` folder off the PATH, so `pip` and `streamlit` are
+> "not recognized" even though they are installed. `python -m pip` and
+> `python -m streamlit` always work if Python itself does. (`py -m ...` if `python`
+> is not on the PATH either.)
 
 ### 3. Check the install without spending any quota
 
@@ -74,18 +82,64 @@ fastest working ones in `.env` as `GEMINI_MODEL` and `GEMINI_EMBED_MODEL`.
 
 ### 7. Run it
 
+Two front ends over the same code in `tutor/`.
+
+**As a web app** — the demo interface:
+
+```bash
+python -m streamlit run app.py
+```
+
+It opens at http://localhost:8501. Sidebar: the indexed document, a PDF uploader, and
+which provider and models are live. Three tabs:
+
+- **Topics** — press *Extract topics*; the agent reads the whole document.
+- **Practice exam** — pick a topic and a number of questions. Each question shows its
+  verified source quote, its page, and the quote match percentage. Type an answer and
+  press *Submit* to be graded criterion by criterion.
+- **Chat** — free conversation. With a question open, a plain answer is routed to the
+  grader.
+
+Long operations stream their progress on screen (which passage is being embedded, a
+retry after a 503, seconds elapsed), so a slow call is visibly working rather than
+frozen.
+
+**Reloading:**
+
+| Changed | What to do |
+|---|---|
+| `.env` | Nothing. It is re-read before the next call. |
+| `app.py` | Streamlit offers *Rerun*; or enable *Always rerun* in its ⋮ menu. |
+| anything in `tutor/` | **Restart the process** (`Ctrl+C`, run again). Python caches imported modules, so a rerun alone keeps the old code. |
+
+Restarting costs nothing: the index and the embedding cache live on disk.
+
+**As a chat program:**
+
+```bash
+python scripts/chat.py                 # uses whatever is in data/
+python scripts/chat.py --pdf notes.pdf # ingest one file first
+```
+
+Ask what the document covers, request a summary or a practice exam; when a question is
+open, type your answer and it gets graded. `salir` to quit.
+
+**As the notebook** — the same flow with the reasoning written out:
+
 ```bash
 jupyter notebook notebooks/tutor.ipynb
 ```
 
-Then **Run All**. The first run ingests the PDFs; later runs reuse the vector store and
-the embedding cache.
+Then **Run All**. Its last section is an interactive loop, so it is not a fixed script.
 
-Or from the command line:
+Other entry points:
 
 ```bash
 python scripts/ingest.py --reset          # PDFs -> ChromaDB
-python scripts/search.py "your question"  # check retrieval
+python scripts/search.py "your question"  # check retrieval only
+python scripts/diagnose.py                # time each stage
+python scripts/bench.py                   # compare models on your key
+python scripts/check_ollama.py            # is the local model actually usable?
 ```
 
 ### Running on a local model
@@ -110,6 +164,16 @@ ollama pull qwen3:8b            # chat
 ollama pull nomic-embed-text    # only if you also set EMBED_PROVIDER=ollama
 ```
 
+Then check it, because `OLLAMA_MODEL` must match a tag from `ollama list` **exactly** —
+`qwen3:8b`, `qwen3:8b-instruct` and `qwen3:latest` are three different things:
+
+```bash
+python scripts/check_ollama.py
+```
+
+It reports whether the server answers, lists the installed tags, and sends a test
+message.
+
 Moving *embeddings* to Ollama invalidates the vector store — vectors from different
 models are not comparable — so rebuild it:
 
@@ -129,7 +193,10 @@ that failure is silent: nothing errors, the results are just quietly wrong.
 | `404 ... no longer available to new users` | That model is closed to new keys. Use the replacement its message names. |
 | A cell hangs with no output | Run `python scripts/diagnose.py` — it times each stage separately. |
 | `429 ... PerDay ... limit: 20` | Daily quota spent for that model. See *Running on a local model* above. |
-| Changing `.env` seems to do nothing | Re-run the setup cell; it calls `config.reload()`. |
+| Changing `.env` seems to do nothing | It is re-read automatically before each call. In the notebook, re-run the setup cell. |
+| `pip` / `streamlit` "not recognized" (Windows) | Their folder is not on the PATH. Use `python -m pip`, `python -m streamlit`. |
+| Editing `tutor/*.py` changes nothing | Python caches imported modules. Restart Streamlit, or restart the Jupyter kernel. |
+| "Ollama is not answering" but it is running | `OLLAMA_MODEL` does not match a tag in `ollama list`. Run `python scripts/check_ollama.py`. |
 | Ingestion says no text found | The PDF is scanned images. It needs OCR. |
 
 ---
@@ -225,7 +292,7 @@ progress.
 
 ```
 notebooks/tutor.ipynb      the project: agents, orchestrator, demo
-prompts/system_prompt.txt  shared persona: scope, refusal, language, citations
+prompts/                   system_prompt.txt (shared persona) + one file per agent
 tutor/config.py            settings from .env; config.reload() re-reads them live
 tutor/llm.py               one entry point for LLM calls; retry and fallback policy
 tutor/embeddings.py        Gemini embeddings, batched, cached
@@ -235,6 +302,9 @@ tutor/grounding.py         verifies a quoted sentence exists in the source
 tutor/scoring.py           derives the score from per-criterion verdicts
 tutor/session.py           study state (typed) + conversation memory
 tutor/prompts.py           loads prompts/*.txt, composes persona + role
+tutor/agents.py            the three specialists: topics, exam, grading
+tutor/orchestrator.py      routing and dispatch
+app.py                     Streamlit front end (rendering only, no agent logic)
 tutor/ingest/              pdf_loader -> cleaner -> chunker -> pipeline
 tests/                     offline tests; no API key, no network
 scripts/                   ingest.py, search.py, bench.py, diagnose.py
@@ -254,5 +324,7 @@ python tests/test_grounding.py      # invented quotes rejected, real ones kept
 python tests/test_scoring.py        # the score can never contradict the feedback
 python tests/test_session.py        # the window never eats structured state
 python tests/test_prompts.py        # the shared persona reaches every agent
+python tests/test_orchestrator.py   # routing and dispatch, with fake agents
+python tests/test_progress.py       # progress sinks used by the UI
 python tests/test_notebook_refs.py  # notebook cells reference things that exist
 ```

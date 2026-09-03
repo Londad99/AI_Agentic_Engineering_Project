@@ -103,6 +103,31 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 
+_env_mtime: float = 0.0
+
+
+def reload_if_changed() -> bool:
+    """Re-read .env when the file has changed on disk. Returns True if it did.
+
+    Called before every API call. Editing .env and forgetting to re-run the setup cell
+    is the single most common way to be confused by this project: the file says one
+    thing, the live process another, and the error message reflects neither. A stat()
+    per call is far cheaper than that confusion.
+    """
+    global _env_mtime
+    try:
+        mtime = ENV_FILE.stat().st_mtime
+    except OSError:
+        return False
+    if mtime <= _env_mtime:
+        return False
+    first = _env_mtime == 0.0
+    reload()
+    if not first:
+        print(f"  [config] .env changed on disk - reloaded", flush=True)
+    return True
+
+
 def reload() -> dict:
     """Re-read .env into this module, without restarting the Python process.
 
@@ -114,7 +139,12 @@ def reload() -> dict:
     override=True matters: load_dotenv defaults to not overwriting variables that
     already exist in the environment, which is exactly the case on a second call.
     """
+    global _env_mtime
     load_dotenv(ENV_FILE, override=True)
+    try:
+        _env_mtime = ENV_FILE.stat().st_mtime
+    except OSError:
+        pass
     module = globals()
     module["GOOGLE_API_KEY"] = _read_api_key()
     module["GEMINI_MODEL"] = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")

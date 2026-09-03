@@ -249,6 +249,57 @@ def test_env_names_in_messages_are_real():
     print("env names in messages OK")
 
 
+def test_error_says_whether_the_fallback_ran():
+    """An error must never leave you guessing whether the local model was tried."""
+    def gemini(*a):
+        raise FakeRateLimit(DAILY_429)
+
+    llm._call_gemini = gemini
+    llm.time.sleep = lambda _s: None
+    try:
+        llm.generate("prompt", allow_fallback=False)
+    except llm.LLMError as error:
+        assert "local fallback was NOT used" in str(error)
+        assert "ENABLE_LOCAL_FALLBACK is" in str(error), "does not show the live value"
+        print("fallback status shown OK")
+    else:
+        raise AssertionError("expected LLMError")
+
+
+def test_env_edit_is_picked_up_without_a_restart():
+    """Editing .env mid-session must take effect on the next call, not the next kernel."""
+    import os
+    import tempfile
+
+    from tutor import config
+
+    original_file = config.ENV_FILE
+    # A temp dir, not the repo: tests must not leave files behind next to the code.
+    tmp = Path(tempfile.mkdtemp()) / "test.env"
+    try:
+        tmp.write_text("GEMINI_MODEL=model-a\nGEMINI_EMBED_MODEL=gemini-embedding-001\n")
+        config.ENV_FILE = tmp
+        config._env_mtime = 0.0
+        config.reload_if_changed()
+        assert config.GEMINI_MODEL == "model-a", config.GEMINI_MODEL
+
+        tmp.write_text("GEMINI_MODEL=model-b\nGEMINI_EMBED_MODEL=gemini-embedding-001\n")
+        # Stamp the mtime forward explicitly: some filesystems have one-second
+        # granularity, so two writes in the same second are indistinguishable and the
+        # test would fail for a reason that has nothing to do with the logic.
+        stamp = tmp.stat().st_mtime + 5
+        os.utime(tmp, (stamp, stamp))
+        assert config.reload_if_changed(), "the change on disk was not noticed"
+        assert config.GEMINI_MODEL == "model-b", "still serving the old value"
+
+        assert not config.reload_if_changed(), "reloaded again with no change - wasteful"
+        print("env hot reload        OK")
+    finally:
+        config.ENV_FILE = original_file
+        config._env_mtime = 0.0
+        config.reload()
+
+
 def test_real_bug_is_not_hidden():
     def gemini(*a):
         raise TypeError("bad argument to generate_content")
@@ -355,13 +406,35 @@ def test_fallback_can_be_disabled():
         raise AssertionError("fell back even though allow_fallback was False")
 
 
+def test_running_ollama_with_the_wrong_model_is_not_reported_as_unreachable():
+    """The mistake that cost an evening: Ollama was running the whole time.
+
+    _call_ollama used raise_for_status(), so a 404 "model not found" arrived as a
+    RequestException - the same class as a refused connection - and got reported as
+    "Ollama is unreachable". That sends you to restart a service that was already up,
+    instead of comparing OLLAMA_MODEL against `ollama list`.
+    """
+    llm.ollama_models = lambda: ["llama3:8b", "qwen3:4b"]
+    original = llm.config.OLLAMA_MODEL
+    try:
+        llm.config.OLLAMA_MODEL = "qwen3:8b"
+        report = llm.ollama_report(llm.OllamaRejected(404, 'model "qwen3:8b" not found'))
+        assert "IS running" in report, "still claims the server is down"
+        assert "llama3:8b" in report and "qwen3:4b" in report, "does not list what IS installed"
+        assert "OLLAMA_MODEL" in report, "does not point at the setting to change"
+        print("wrong model reported  OK")
+    finally:
+        llm.config.OLLAMA_MODEL = original
+
+
 def test_unreachable_ollama_message():
     def gemini(*a):
         raise FakeRateLimit("429")
 
     def ollama(*a):
-        raise requests.exceptions.ConnectionError("refused")
+        raise llm.OllamaUnreachable("connection refused")
 
+    llm.ollama_models = lambda: None       # server genuinely not answering
     llm._call_gemini, llm._call_ollama = gemini, ollama
     try:
         llm.generate("prompt", allow_fallback=True)
@@ -386,6 +459,8 @@ if __name__ == "__main__":
     test_forced_local_never_calls_gemini()
     test_invalid_provider_is_rejected()
     test_env_names_in_messages_are_real()
+    test_error_says_whether_the_fallback_ran()
+    test_env_edit_is_picked_up_without_a_restart()
     test_api_4xx_is_wrapped_not_buried()
     test_real_bug_is_not_hidden()
     test_httpx_timeout_is_transient()
@@ -395,6 +470,7 @@ if __name__ == "__main__":
     test_exhausted_retries_fall_back()
     test_outage_message_is_actionable()
     test_fallback_can_be_disabled()
+    test_running_ollama_with_the_wrong_model_is_not_reported_as_unreachable()
     test_unreachable_ollama_message()
     test_think_block_is_stripped()
     print("\nall llm routing tests passed")

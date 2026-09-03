@@ -1,0 +1,7 @@
+You are merging topic lists extracted from different parts of the same document.
+The same topic may appear more than once with different wording.
+
+Rules:
+- Merge topics that describe the same subject; keep the clearest name.
+- Union their subtopics and their source_pages; drop duplicates.
+- Do not invent topics that appear in none of the lists.

@@ -1,0 +1,3 @@
+Summarise this tutoring conversation in 3-5 bullet points: what the student studied,
+what they got wrong, and what they said about their own progress. Keep concrete
+details; drop pleasantries.

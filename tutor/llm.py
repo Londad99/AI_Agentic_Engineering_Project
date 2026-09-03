@@ -41,6 +41,19 @@ class LLMError(TutorError):
     """Every provider failed, or one failed in a way we must not paper over."""
 
 
+class OllamaUnreachable(TutorError):
+    """Nothing is listening on OLLAMA_HOST."""
+
+
+class OllamaRejected(TutorError):
+    """Ollama answered, and said no - usually because the model is not pulled."""
+
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"Ollama returned {status}: {body[:200]}")
+
+
 @dataclass
 class LLMResponse:
     """The text plus who produced it — the provider is shown in the demo on purpose."""
@@ -180,8 +193,24 @@ def _call_ollama(prompt: str, system: str | None, schema: Type[BaseModel] | None
         # model drives both providers.
         payload["format"] = schema.model_json_schema()
 
-    response = requests.post(f"{config.OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
-    response.raise_for_status()
+    try:
+        response = requests.post(f"{config.OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+    except requests.exceptions.RequestException as error:
+        # Genuinely cannot reach the server: nothing listening, wrong host, timeout.
+        raise OllamaUnreachable(str(error)) from error
+
+    if response.status_code == 400 and "think" in payload:
+        # Older builds reject the "think" field outright. Drop it and retry once; the
+        # regex below still strips the reasoning block from the answer.
+        payload.pop("think")
+        response = requests.post(f"{config.OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+
+    if not response.ok:
+        # Reached the server, and it refused. That is a different problem from being
+        # unreachable, and reporting it as "unreachable" sends you to restart a service
+        # that was running all along.
+        raise OllamaRejected(response.status_code, response.text)
+
     content = response.json()["message"]["content"]
     # Belt and braces: older Ollama builds ignore "think", so strip the block anyway.
     return THINK_BLOCK_RE.sub("", content).strip()
@@ -210,6 +239,7 @@ def generate(
     # Validated here, not only inside get_client(): the client is a cached singleton,
     # so once it exists the check inside it never runs again. A guard that only fires
     # on the first call is a guard you cannot rely on.
+    config.reload_if_changed()   # so editing .env takes effect without re-running a cell
     config.validate_models()
 
     if config.LLM_PROVIDER == "ollama":
@@ -254,19 +284,29 @@ def generate(
             raise  # a real bug in our code: TypeError, ValueError. Do not dress it up.
 
     if not allow_fallback:
-        raise LLMError(_explain(last_error)) from last_error
+        raise LLMError(_explain(last_error) + "\n\n" + _fallback_status()) from last_error
 
     status(f"  [fallback] Gemini unusable -> {config.OLLAMA_MODEL} via Ollama")
     try:
         with step(f"{config.OLLAMA_MODEL} (local, this is slower)"):
             text = _call_ollama(prompt, system, schema, temperature)
         return LLMResponse(text, "ollama", config.OLLAMA_MODEL)
-    except requests.exceptions.RequestException as error:
-        raise LLMError(
-            f"{_explain(last_error)}\n\n"
-            f"The local fallback is enabled but Ollama is unreachable at {config.OLLAMA_HOST}.\n"
-            f"Start it with `ollama serve`, or set ENABLE_LOCAL_FALLBACK=false in .env."
-        ) from error
+    except (OllamaUnreachable, OllamaRejected, requests.exceptions.RequestException) as error:
+        raise LLMError(f"{_explain(last_error)}\n\n{ollama_report(error)}") from error
+
+
+def _fallback_status() -> str:
+    """State what the fallback did, so the message is never ambiguous.
+
+    Without this line an error looks identical whether the local model was tried and
+    failed, or never consulted at all - and the usual cause of the second case is a
+    .env edit the running process has not picked up.
+    """
+    return (
+        f"The local fallback was NOT used: ENABLE_LOCAL_FALLBACK is "
+        f"{config.ENABLE_LOCAL_FALLBACK} in this process, LLM_PROVIDER={config.LLM_PROVIDER}.\n"
+        f"If your .env says otherwise, the change has not been read yet - re-run the setup cell."
+    )
 
 
 def _short(error: Exception) -> str:
@@ -346,12 +386,46 @@ def _explain(error: Exception | None) -> str:
     )
 
 
+def ollama_models() -> list[str] | None:
+    """Model tags Ollama has pulled, or None if the server cannot be reached."""
+    try:
+        response = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
+        response.raise_for_status()
+        return [m["name"] for m in response.json().get("models", [])]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ollama_report(error: Exception | None = None) -> str:
+    """Say what is actually wrong, with the installed tags listed.
+
+    "Ollama is unreachable" sends you to restart a service that was already running.
+    Nine times out of ten the server is fine and OLLAMA_MODEL simply does not match a
+    tag in `ollama list` - so the list goes in the message.
+    """
+    models = ollama_models()
+    if models is None:
+        return (
+            f"Ollama is not answering at {config.OLLAMA_HOST}.\n"
+            f"Start it with `ollama serve`, or set ENABLE_LOCAL_FALLBACK=false in .env."
+        )
+    if config.OLLAMA_MODEL not in models:
+        return (
+            f"Ollama IS running at {config.OLLAMA_HOST}, but it has no model tagged "
+            f"'{config.OLLAMA_MODEL}'.\n"
+            f"Installed: {', '.join(models) if models else '(none)'}\n"
+            f"Either set OLLAMA_MODEL in .env to one of those exact tags, or run:\n"
+            f"    ollama pull {config.OLLAMA_MODEL}"
+        )
+    detail = f"\nOllama said: {error}" if error else ""
+    return f"Ollama has '{config.OLLAMA_MODEL}' but the call failed.{detail}"
+
+
 def ollama_available(model: str | None = None) -> bool:
     """Used by the notebook to report honestly whether the fallback is armed."""
     try:
-        response = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
-        models = [m["name"] for m in response.json().get("models", [])]
+        models = ollama_models()
         wanted = (model or config.OLLAMA_MODEL).split(":")[0]
-        return any(m.split(":")[0] == wanted for m in models)
+        return any(m.split(":")[0] == wanted for m in (models or []))
     except Exception:  # noqa: BLE001
         return False
