@@ -22,11 +22,11 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from tutor import agents, config, llm, orchestrator, progress  # noqa: E402
+from tutor import agents, config, library, llm, orchestrator, progress  # noqa: E402
 from tutor.errors import TutorError  # noqa: E402
 from tutor.ingest.pipeline import ingest  # noqa: E402
 from tutor.session import StudySession  # noqa: E402
-from tutor.vectorstore import get_collection  # noqa: E402
+from tutor.vectorstore import get_collection, list_sources, remove_source  # noqa: E402
 
 st.set_page_config(page_title="Study Tutor", layout="wide")
 
@@ -92,10 +92,13 @@ def run(label: str, function, *args, **kwargs):
     """
     with st.status(label, expanded=True) as box:
         log: list[str] = []
+        # One placeholder, rewritten in place. Calling box.code() per line APPENDS a new
+        # block each time, which is how the log ended up printed once per update.
+        view = box.empty()
 
         def sink(line: str) -> None:
             log.append(line.rstrip())
-            box.code("\n".join(log[-14:]), language=None)
+            view.code("\n".join(log[-14:]), language=None)
 
         try:
             with progress.capture(sink):
@@ -121,14 +124,38 @@ with st.sidebar:
     st.markdown("### Document")
 
     chunks_stored = collection().count()
-    pdfs = sorted(p.name for p in config.DATA_DIR.glob("*.pdf"))
-    if pdfs:
-        st.markdown(
-            f"<span class='meta'>{', '.join(pdfs)}<br>{chunks_stored} chunks indexed</span>",
-            unsafe_allow_html=True,
-        )
+    indexed = list_sources(collection())
+
+    if indexed:
+        for name, count in indexed.items():
+            row, action = st.columns([4, 1])
+            row.markdown(f"<span class='meta'>{name}<br>{count} chunks</span>",
+                         unsafe_allow_html=True)
+            if action.button("✕", key=f"drop_{name}", help=f"Remove {name} from the index"):
+                removed = remove_source(name, collection())
+                # Both halves, or the next ingest silently puts the document back.
+                try:
+                    library.archive(name)
+                except FileNotFoundError:
+                    pass   # already gone from data/; the index entries are what mattered
+                # Topics, exam and scores were derived from a document that is now gone.
+                st.session_state.session = StudySession()
+                st.session_state.chat = []
+                st.session_state.exam_report = []
+                collection.clear()
+                st.toast(f"{name}: {removed} chunks removed, file moved to data/_removed/")
+                st.rerun()
     else:
-        st.markdown("<span class='meta'>no PDF in data/</span>", unsafe_allow_html=True)
+        st.markdown("<span class='meta'>nothing indexed</span>", unsafe_allow_html=True)
+
+    orphans = [p.name for p in library.list_pdfs() if p.name not in indexed]
+    if orphans:
+        st.markdown(f"<span class='meta'>in data/ but not indexed: {', '.join(orphans)}</span>",
+                    unsafe_allow_html=True)
+        if st.button("Index them", use_container_width=True):
+            if run("Reading", ingest):
+                collection.clear()
+                st.rerun()
 
     upload = st.file_uploader("Add a PDF", type="pdf", label_visibility="collapsed")
     if upload is not None and st.button("Ingest", use_container_width=True):
@@ -264,7 +291,9 @@ with exam_tab:
                 check = st.session_state.exam_report[index]
                 answered = index < session.current_index
                 header = f"{index + 1}. {question.question}"
-                with st.expander(header, expanded=index == session.current_index):
+                # Open the pending question, and any question whose feedback just arrived.
+                just_graded = st.session_state.get(f"result_{index}") is not None
+                with st.expander(header, expanded=index == session.current_index or just_graded):
                     st.markdown(
                         f"<span class='meta'>{question.difficulty} · page {question.source_page} · "
                         f"quote verified {check['score']:.0%}</span>",
@@ -273,27 +302,48 @@ with exam_tab:
                     st.markdown(f"<div class='quote'>{question.source_quote}</div>",
                                 unsafe_allow_html=True)
 
-                    if answered:
-                        st.markdown("<span class='meta'>answered</span>", unsafe_allow_html=True)
-                        continue
+                    if not answered:
+                        answer = st.text_area("Your answer", key=f"answer_{index}",
+                                              label_visibility="collapsed", height=110)
+                        if st.button("Submit", key=f"submit_{index}"):
+                            result = run("Grading", agents.grade_answer, question, answer)
+                            if result:
+                                session.record_score(exam.topic, result["score"])
+                                session.advance()
+                                st.session_state[f"result_{index}"] = result
+                                st.rerun()
 
-                    answer = st.text_area("Your answer", key=f"answer_{index}",
-                                          label_visibility="collapsed", height=110)
-                    if st.button("Submit", key=f"submit_{index}"):
-                        result = run("Grading", agents.grade_answer, question, answer)
-                        if result:
-                            session.record_score(exam.topic, result["score"])
-                            session.advance()
-                            st.session_state[f"result_{index}"] = result
-                            st.rerun()
-
+                    # Rendered whether or not the question is answered. Skipping this for
+                    # answered ones is what made grading look like it produced nothing:
+                    # advance() flips `answered` before the rerun that would have drawn it.
                     result = st.session_state.get(f"result_{index}")
                     if result:
-                        st.markdown(f"**{result['verdict'].replace('_', ' ')}** · {result['score']:.0%}")
-                        for point in result["feedback"].points:
+                        feedback = result["feedback"]
+                        st.markdown(
+                            f"**{result['verdict'].replace('_', ' ')}** · {result['score']:.0%}"
+                        )
+                        for point in feedback.points:
                             mark = {"covered": "✓", "partial": "~", "missing": "✗"}[point.status]
-                            st.markdown(f"{mark} {point.key_point} — <span class='meta'>"
-                                        f"{point.comment}</span>", unsafe_allow_html=True)
+                            st.markdown(
+                                f"{mark} **{point.key_point}** — <span class='meta'>"
+                                f"{point.comment}</span>",
+                                unsafe_allow_html=True,
+                            )
+                        if feedback.what_was_right:
+                            st.markdown(f"<span class='meta'>Right: {feedback.what_was_right}"
+                                        f"</span>", unsafe_allow_html=True)
+                        if feedback.misconceptions:
+                            for item in feedback.misconceptions:
+                                st.markdown(f"<span class='meta'>Incorrect: {item}</span>",
+                                            unsafe_allow_html=True)
+                        pages = ", ".join(str(x) for x in sorted(set(feedback.source_pages)))
+                        st.markdown(f"<span class='meta'>Review: {feedback.what_to_review} "
+                                    f"(p. {pages})</span>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='quote'>Your answer: "
+                                    f"{st.session_state.get(f'answer_{index}', '')}</div>",
+                                    unsafe_allow_html=True)
+                    elif answered:
+                        st.markdown("<span class='meta'>answered</span>", unsafe_allow_html=True)
 
 
 # ---- Chat ------------------------------------------------------------------ #

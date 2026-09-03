@@ -90,8 +90,8 @@ Two front ends over the same code in `tutor/`.
 python -m streamlit run app.py
 ```
 
-It opens at http://localhost:8501. Sidebar: the indexed document, a PDF uploader, and
-which provider and models are live. Three tabs:
+It opens at http://localhost:8501. The sidebar lists each indexed document with its
+chunk count, a `✕` to remove it, and an uploader to add more. Three tabs:
 
 - **Topics** — press *Extract topics*; the agent reads the whole document.
 - **Practice exam** — pick a topic and a number of questions. Each question shows its
@@ -99,6 +99,11 @@ which provider and models are live. Three tabs:
   press *Submit* to be graded criterion by criterion.
 - **Chat** — free conversation. With a question open, a plain answer is routed to the
   grader.
+
+Removing a document does two things: its chunks are deleted from the index **and** the
+PDF is moved to `data/_removed/`. Only doing the first would leave the file where the
+next ingestion picks it up again, which looks exactly like the removal not working. The
+file is archived rather than deleted — undo is moving it back.
 
 Long operations stream their progress on screen (which passage is being embedded, a
 retry after a 503, seconds elapsed), so a slow call is visibly working rather than
@@ -301,6 +306,7 @@ tutor/vectorstore.py       ChromaDB: storage, semantic search, full listing
 tutor/grounding.py         verifies a quoted sentence exists in the source
 tutor/scoring.py           derives the score from per-criterion verdicts
 tutor/session.py           study state (typed) + conversation memory
+tutor/library.py           the PDFs on disk: listing, archiving, restoring
 tutor/prompts.py           loads prompts/*.txt, composes persona + role
 tutor/agents.py            the three specialists: topics, exam, grading
 tutor/orchestrator.py      routing and dispatch
@@ -308,7 +314,7 @@ app.py                     Streamlit front end (rendering only, no agent logic)
 tutor/ingest/              pdf_loader -> cleaner -> chunker -> pipeline
 tests/                     offline tests; no API key, no network
 scripts/                   ingest.py, search.py, bench.py, diagnose.py
-data/                      your PDFs (git-ignored)
+data/                      your PDFs (git-ignored); _removed/ holds detached ones
 storage/                   ChromaDB + embedding cache (git-ignored)
 ```
 
@@ -326,5 +332,6 @@ python tests/test_session.py        # the window never eats structured state
 python tests/test_prompts.py        # the shared persona reaches every agent
 python tests/test_orchestrator.py   # routing and dispatch, with fake agents
 python tests/test_progress.py       # progress sinks used by the UI
+python tests/test_library.py        # archiving never destroys a document
 python tests/test_notebook_refs.py  # notebook cells reference things that exist
 ```

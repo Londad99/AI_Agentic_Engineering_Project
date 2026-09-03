@@ -84,6 +84,38 @@ def add_chunks(chunks: list[Chunk], collection=None) -> int:
     return len(chunks)
 
 
+def list_sources(collection=None) -> dict[str, int]:
+    """Indexed documents and how many chunks each contributed."""
+    collection = collection or get_collection()
+    if collection.count() == 0:
+        return {}
+    result = collection.get(include=["metadatas"])
+    counts: dict[str, int] = {}
+    for metadata in result["metadatas"]:
+        name = metadata.get("source", "?")
+        counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def remove_source(name: str, collection=None) -> int:
+    """Delete one document's chunks. Returns how many were removed.
+
+    Only half of a removal - see tutor/library.archive() for the other half. On its own
+    this leaves the PDF in data/, where the next ingest() puts it straight back.
+    """
+    collection = collection or get_collection()
+    before = collection.count()
+    collection.delete(where={"source": name})
+    after = collection.count()
+    if after == 0:
+        # An empty store has no embedding model, so the next ingest is free to use a
+        # different one. Leaving the marker behind would block that switch forever.
+        marker = collection_marker()
+        if marker.exists():
+            marker.unlink()
+    return before - after
+
+
 def list_all_chunks(collection=None) -> list[dict]:
     """Every chunk, in document order.
 

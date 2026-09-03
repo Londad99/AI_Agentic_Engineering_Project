@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 storage/
-data/*.pdf
+# The student's own material never goes in the repo. The glob must be recursive:
+# data/*.pdf alone would leave data/_removed/*.pdf tracked.
+data/**/*.pdf
+data/_removed/
 !data/.gitkeep
 .ipynb_checkpoints/
