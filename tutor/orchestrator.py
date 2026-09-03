@@ -16,7 +16,8 @@ from . import agents, grounding, llm, prompts
 from .session import StudySession
 
 INTENTS = Literal[
-    "map_topics", "summarize_topic", "generate_exam", "grade_answer", "progress", "out_of_scope"
+    "answer_question", "map_topics", "summarize_topic", "generate_exam",
+    "grade_answer", "progress", "out_of_scope",
 ]
 
 
@@ -73,7 +74,11 @@ def handle(message: str, session: StudySession, show_route: bool = True) -> str:
     session.conversation.add("student", message)
     lines = [f"[route: {decision.intent}]"] if show_route else []
 
-    if decision.intent == "map_topics":
+    if decision.intent == "answer_question":
+        answer, _ = agents.answer_question(message)
+        lines.append(agents.format_answer(answer))
+
+    elif decision.intent == "map_topics":
         if session.topic_map is None:
             session.topic_map = agents.extract_topics()
         lines += [f"- {t.name}: {t.summary}" for t in session.topic_map.topics]

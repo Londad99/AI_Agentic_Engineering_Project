@@ -19,7 +19,10 @@ from tutor.session import StudySession  # noqa: E402
 progress.VERBOSE = False
 
 PASSAGE = "Las vacas establecen jerarquias sociales dentro de sus grupos y se reconocen entre si."
-HITS = [{"text": PASSAGE, "metadata": {"page": 3, "source": "notes.pdf", "chunk_index": 0}}]
+HITS = [{"text": PASSAGE, "score": 0.81,
+         "metadata": {"page": 3, "source": "notes.pdf", "chunk_index": 0}}]
+WEAK_HITS = [{"text": "Texto sin relacion alguna.", "score": 0.21,
+              "metadata": {"page": 9, "source": "notes.pdf", "chunk_index": 0}}]
 
 TOPIC = agents.Topic(
     name="Comportamiento social",
@@ -51,7 +54,7 @@ def question(quote: str, page: int = 3) -> agents.ExamQuestion:
     )
 
 
-def install(route_obj=None, exam=None, feedback=None):
+def install(route_obj=None, exam=None, feedback=None, answer=None, hits=None):
     """Point every LLM call at canned objects and the vector store at one passage."""
     def fake_generate(prompt=None, system=None, schema=None, **kwargs):
         if schema is orchestrator.Route:
@@ -62,11 +65,13 @@ def install(route_obj=None, exam=None, feedback=None):
             return FakeResponse(feedback)
         if schema is agents.TopicMap:
             return FakeResponse(TOPIC_MAP)
+        if schema is agents.GroundedAnswer:
+            return FakeResponse(answer)
         return FakeResponse(None)
 
     orchestrator.llm.generate = fake_generate
     agents.llm.generate = fake_generate
-    agents.search = lambda *a, **k: HITS
+    agents.search = lambda *a, **k: (HITS if hits is None else hits)
     agents.list_all_chunks = lambda *a, **k: HITS
 
 
@@ -83,6 +88,63 @@ def test_ungrounded_questions_never_reach_the_student():
     assert len(session.current_exam.questions) == 1, "an invented question survived"
     assert "1 question(s) dropped" in reply, "the drop was not reported"
     print("ungrounded dropped    OK")
+
+
+def test_a_question_the_document_cannot_answer_is_declined_without_an_api_call():
+    """The rubric's edge case, and the one the instructor will try.
+
+    Two gates, and this exercises the cheap one: when no passage clears the retrieval
+    threshold, the passages are simply not about the question, and calling the model to
+    confirm that would spend quota to learn what the scores already said.
+    """
+    install(route_obj=orchestrator.Route(intent="answer_question"), hits=WEAK_HITS)
+
+    # agents and orchestrator share one llm module, so the router still needs to work.
+    # Count only the answering call, by the schema it asks for.
+    answered_calls = []
+    inner = agents.llm.generate
+
+    def counting(prompt=None, system=None, schema=None, **kwargs):
+        if schema is agents.GroundedAnswer:
+            answered_calls.append(1)
+        return inner(prompt=prompt, system=system, schema=schema, **kwargs)
+
+    agents.llm.generate = counting
+    reply = orchestrator.handle("¿Qué dice sobre la fórmula de Little?",
+                                StudySession(topic_map=TOPIC_MAP))
+    assert "does not cover this" in reply, reply
+    assert not answered_calls, "spent an API call to decline what retrieval had already ruled out"
+    print("declines cheaply      OK")
+
+
+def test_the_model_can_still_decline_on_well_scoring_passages():
+    """Passages can score well and not contain the answer, so the schema forces an
+    explicit answered=false instead of letting a hedge pass for an answer."""
+    install(
+        route_obj=orchestrator.Route(intent="answer_question"),
+        answer=agents.GroundedAnswer(
+            answered=False, answer="",
+            missing="El documento describe jerarquías, no la fórmula de Little.",
+            source_pages=[],
+        ),
+    )
+    reply = orchestrator.handle("¿y la fórmula de Little?", StudySession(topic_map=TOPIC_MAP))
+    assert "does not cover this" in reply and "fórmula de Little" in reply, reply
+    print("model can decline     OK")
+
+
+def test_a_supported_question_is_answered_with_pages():
+    install(
+        route_obj=orchestrator.Route(intent="answer_question"),
+        answer=agents.GroundedAnswer(
+            answered=True,
+            answer="Los grupos se organizan mediante jerarquías sociales.",
+            missing="", source_pages=[3],
+        ),
+    )
+    reply = orchestrator.handle("¿cómo se organizan?", StudySession(topic_map=TOPIC_MAP))
+    assert "jerarquías sociales" in reply and "p. 3" in reply, reply
+    print("answers with pages    OK")
 
 
 def test_bare_answer_routes_to_the_grader():
@@ -141,6 +203,9 @@ def test_empty_answer_costs_no_api_call():
 
 if __name__ == "__main__":
     test_ungrounded_questions_never_reach_the_student()
+    test_a_question_the_document_cannot_answer_is_declined_without_an_api_call()
+    test_the_model_can_still_decline_on_well_scoring_passages()
+    test_a_supported_question_is_answered_with_pages()
     test_bare_answer_routes_to_the_grader()
     test_grading_with_no_open_question_does_not_crash()
     test_unknown_topic_asks_instead_of_guessing()

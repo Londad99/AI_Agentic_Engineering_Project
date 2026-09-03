@@ -7,6 +7,8 @@ prompts/system_prompt.txt.
 Where RAG is used, and where it is not:
   Topic Extractor - NO retrieval. Needs coverage of the whole document; similarity
                     search is built to discard most of it. Opposite goals.
+  Answerer        - retrieval on the question, with a score floor: below it the
+                    document does not cover the question and we say so.
   Exam Generator  - retrieval on the topic name plus its subtopics.
   Grader          - retrieval on the question AND the student's answer, so unsupported
                     claims can be identified as such.
@@ -137,7 +139,71 @@ def extract_topics(chunks=None) -> TopicMap:
 
 
 # --------------------------------------------------------------------------- #
-# Agent 2 - Exam Generator (RAG on the topic)
+# Agent 2 - Answerer (RAG on the question)
+# --------------------------------------------------------------------------- #
+
+# Below this similarity, the retrieved passages are not about the question. Tuned
+# against observed scores: a real hit on this corpus lands at 0.70-0.85, and unrelated
+# text sits well under 0.40.
+ANSWER_THRESHOLD = 0.45
+
+
+class GroundedAnswer(BaseModel):
+    answered: bool = Field(description="false if the passages do not contain the answer")
+    answer: str = Field(description="the answer, empty when answered is false")
+    missing: str = Field(description="what the document does not cover, when answered is false")
+    source_pages: list[int] = Field(description="pages the answer comes from")
+
+
+def answer_question(question: str, top_k: int = RETRIEVAL_K) -> tuple[GroundedAnswer, list[dict]]:
+    """Answer from the document, or say plainly that the document does not cover it.
+
+    Declining is a feature, not a fallback. A student revising for an exam is harmed
+    more by a confident answer their professor never taught than by "this is not in
+    your notes".
+
+    Two independent gates, because either alone is weak:
+
+      1. Retrieval score. If nothing clears ANSWER_THRESHOLD, the passages are not about
+         the question and we decline WITHOUT calling the model - no quota spent to be
+         told what the numbers already said.
+      2. The model's own judgement. Passages can score well and still not contain the
+         answer, so the schema forces an explicit answered=true/false rather than
+         letting a hedge ("the document suggests...") pass for an answer.
+    """
+    hits = search(question, top_k=top_k)
+    best = max((h["score"] for h in hits), default=0.0)
+
+    if not hits or best < ANSWER_THRESHOLD:
+        status(f"  no passage above {ANSWER_THRESHOLD:.2f} (best {best:.2f}) - declining")
+        return (
+            GroundedAnswer(
+                answered=False,
+                answer="",
+                missing="Nothing in the indexed document is close to this question.",
+                source_pages=[],
+            ),
+            hits,
+        )
+
+    response = llm.generate(
+        prompt=f"QUESTION:\n{question}\n\nPASSAGES:\n{as_passages(hits)}",
+        system=prompts.system(prompts.load("answerer")),
+        schema=GroundedAnswer,
+        temperature=0.1,
+    )
+    return response.parse(GroundedAnswer), hits
+
+
+def format_answer(answer: GroundedAnswer) -> str:
+    if not answer.answered:
+        return f"The document does not cover this. {answer.missing}".strip()
+    pages = ", ".join(str(p) for p in sorted(set(answer.source_pages)))
+    return f"{answer.answer}\n\n(p. {pages})" if pages else answer.answer
+
+
+# --------------------------------------------------------------------------- #
+# Agent 3 - Exam Generator (RAG on the topic)
 # --------------------------------------------------------------------------- #
 
 
@@ -181,7 +247,7 @@ def verify_exam(exam: Exam, hits: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# Agent 3 - Grader (RAG on question + answer)
+# Agent 4 - Grader (RAG on question + answer)
 # --------------------------------------------------------------------------- #
 
 

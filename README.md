@@ -214,6 +214,7 @@ are retrieval questions.
 | Stage | RAG? | Query | Why |
 |---|---|---|---|
 | Ingestion | — | — | Deterministic transformation, no LLM at all. |
+| **Answerer** | **Yes** | the question itself | Plain Q&A, with a score floor: below it the document does not cover the question and the assistant says so. |
 | **Topic Extractor** | **No** | reads every chunk | Needs **coverage**; retrieval is built to discard most of the document. Opposite goals. |
 | **Exam Generator** | **Yes** | topic name + subtopics | "Which passages are about this topic?" is exactly a similarity question. |
 | **Grader** | **Yes** | question + the student's answer | Finds where the answer should come from *and* where the student's claims come from. |
@@ -254,6 +255,13 @@ never answers from the document: every grounding guarantee lives inside the
 specialists, so an orchestrator that answered directly would be an unchecked fourth
 agent.
 
+**Answerer** — retrieves passages for the question and answers from them, citing pages.
+When nothing clears the similarity floor it declines *without calling the model*, and
+even on good passages the schema forces an explicit `answered: true/false` rather than
+letting a hedge ("the document suggests…") pass for an answer. Declining is a feature:
+a student revising for an exam is harmed more by a confident answer their professor
+never taught than by "this is not in your notes".
+
 **Topic Extractor** — reads the whole document in order and returns topics, subtopics
 and page numbers. Map-reduce: topics per batch, then one call merging duplicates
 across batches.
@@ -264,6 +272,18 @@ with a correct answer, the criteria a correct answer must contain, a difficulty 
 
 **Grader** — marks each criterion `covered` / `partial` / `missing`, names what was
 right, what to review and which claims the document contradicts.
+
+### Graceful refusal
+
+Two independent gates, because either alone is weak:
+
+1. **Retrieval score** (`ANSWER_THRESHOLD = 0.45`). Real hits on this corpus land at
+   0.70–0.85 and unrelated text well under 0.40. Below the floor the assistant declines
+   and spends no quota confirming what the numbers already said.
+2. **The model's own judgement.** Passages can score well and still not contain the
+   answer, so `GroundedAnswer.answered` is a required boolean.
+
+Out-of-scope messages (the weather, another course) are refused earlier, by the router.
 
 ### Two verification steps
 
@@ -298,6 +318,7 @@ progress.
 ```
 notebooks/tutor.ipynb      the project: agents, orchestrator, demo
 prompts/                   system_prompt.txt (shared persona) + one file per agent
+                           (answerer, topic_extractor, exam_generator, grader, router)
 tutor/config.py            settings from .env; config.reload() re-reads them live
 tutor/llm.py               one entry point for LLM calls; retry and fallback policy
 tutor/embeddings.py        Gemini embeddings, batched, cached
