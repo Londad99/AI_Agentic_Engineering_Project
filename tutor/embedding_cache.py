@@ -1,18 +1,10 @@
 """On-disk cache of embedding vectors.
 
-An embedding is a pure function of (model, task_type, dimensionality, text): the
-same input always yields the same vector. Calling the API twice for it is pure
-waste - of time, of quota, and of the user's patience while a notebook cell that
-should be instant sits on a network round trip.
+An embedding is a pure function of (model, task_type, dimensions, text), so paying for
+the same one twice is waste - and a notebook re-runs the same query on every iteration.
 
-That matters most exactly where this project lives. Re-running a notebook cell
-while iterating on a prompt re-embeds the identical question every time, and
-re-ingesting a PDF after fixing one page re-embeds every chunk that did not
-change. The cache turns both into a local lookup.
-
-SQLite rather than JSON because vectors are stored as raw float32 bytes: 768
-floats is 3 KB binary against roughly 15 KB of JSON text, and lookups do not
-require loading the whole file into memory.
+SQLite with raw float32 blobs: 768 floats is 3 KB binary against ~15 KB of JSON, and
+lookups do not load the whole file.
 """
 
 from __future__ import annotations

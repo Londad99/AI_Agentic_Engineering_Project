@@ -11,12 +11,46 @@ from __future__ import annotations
 
 import chromadb
 
+from . import config
 from .config import CHROMA_COLLECTION, STORAGE_DIR
 from .embeddings import embed_documents, embed_query
 from .ingest.chunker import Chunk
 from .progress import status, step
 
 _client: chromadb.ClientAPI | None = None
+
+
+_MODEL_MARKER = "embedding_model.txt"
+
+
+def collection_marker():
+    """Path of the file recording which embedding model built this store."""
+    return STORAGE_DIR / _MODEL_MARKER
+
+
+def _check_embedding_model() -> None:
+    """Refuse to mix vector spaces.
+
+    Vectors from two different embedding models are not comparable, so searching a
+    store built with one model using another returns confident nonsense - the worst
+    failure mode, because nothing errors. The model that built the store is recorded
+    on first ingest and checked from then on.
+    """
+    from .errors import ConfigError
+
+    marker = STORAGE_DIR / _MODEL_MARKER
+    current = config.active_embed_model()
+    if not marker.exists():
+        STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        marker.write_text(current, encoding="utf-8")
+        return
+    stored = marker.read_text(encoding="utf-8").strip()
+    if stored != current:
+        raise ConfigError(
+            f"This vector store was built with '{stored}' but EMBED_PROVIDER/model now "
+            f"resolves to '{current}'.\nVectors from different models are not comparable. "
+            f"Rebuild it:\n    python scripts/ingest.py --reset"
+        )
 
 
 def get_collection(name: str = CHROMA_COLLECTION):
@@ -39,6 +73,7 @@ def add_chunks(chunks: list[Chunk], collection=None) -> int:
     if not chunks:
         return 0
     collection = collection or get_collection()
+    _check_embedding_model()
     vectors = embed_documents([c.text for c in chunks])
     collection.upsert(  # upsert, not add: deterministic ids make re-ingestion idempotent
         ids=[c.id for c in chunks],
@@ -82,6 +117,7 @@ def search(query: str, top_k: int = 5, threshold: float | None = None, collectio
     score the notebook used, so `threshold` means the same thing it did there.
     """
     collection = collection or get_collection()
+    _check_embedding_model()
     total = collection.count()
     if total == 0:
         return []

@@ -66,8 +66,39 @@ def _normalize(vector: list[float]) -> list[float]:
     return (array / norm).tolist() if norm else array.tolist()
 
 
+def _call_ollama_embed(texts: list[str]) -> list[list[float]]:
+    """Local embeddings, for when the Gemini daily quota is spent.
+
+    No task_type here: local embedding models are symmetric, so queries and documents
+    go through the same call. The cache key still records the model, so switching
+    providers can never serve a Gemini vector for an Ollama one.
+    """
+    import requests
+
+    response = requests.post(
+        f"{config.OLLAMA_HOST}/api/embed",
+        json={"model": config.OLLAMA_EMBED_MODEL, "input": texts},
+        timeout=config.REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code == 404:  # older Ollama: one text per call, different route
+        vectors = []
+        for text in texts:
+            older = requests.post(
+                f"{config.OLLAMA_HOST}/api/embeddings",
+                json={"model": config.OLLAMA_EMBED_MODEL, "prompt": text},
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
+            )
+            older.raise_for_status()
+            vectors.append(older.json()["embedding"])
+        return [_normalize(v) for v in vectors]
+    response.raise_for_status()
+    return [_normalize(v) for v in response.json()["embeddings"]]
+
+
 def _embed_batch(texts: list[str], task_type: str) -> list[list[float]]:
     config.validate_models()  # cheap, and the cached client would otherwise skip the check
+    if config.EMBED_PROVIDER == "ollama":
+        return _call_ollama_embed(texts)
     request_config = types.EmbedContentConfig(
         task_type=task_type, output_dimensionality=config.EMBED_DIM
     )
@@ -88,7 +119,8 @@ def _embed_batch(texts: list[str], task_type: str) -> list[list[float]]:
 
 def _embed_cached(texts: list[str], task_type: str) -> list[list[float]]:
     """Cache lookup first, one API call for whatever is left, then store the new ones."""
-    keys = [embedding_cache.make_key(t, config.GEMINI_EMBED_MODEL, task_type, config.EMBED_DIM) for t in texts]
+    model = config.active_embed_model()
+    keys = [embedding_cache.make_key(t, model, task_type, config.EMBED_DIM) for t in texts]
     cached = embedding_cache.get_many(keys)
 
     missing = [(i, t) for i, (k, t) in enumerate(zip(keys, texts)) if k not in cached]
@@ -100,7 +132,7 @@ def _embed_cached(texts: list[str], task_type: str) -> list[list[float]]:
     fresh: dict[str, list[float]] = {}
     for start in range(0, len(missing), config.EMBED_BATCH_SIZE):
         block = missing[start : start + config.EMBED_BATCH_SIZE]
-        with step(f"embedding {len(block)} text(s) with {config.GEMINI_EMBED_MODEL}"):
+        with step(f"embedding {len(block)} text(s) with {model}"):
             vectors = _embed_batch([t for _, t in block], task_type)
         for (index, _), vector in zip(block, vectors):
             fresh[keys[index]] = vector

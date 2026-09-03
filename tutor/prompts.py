@@ -1,14 +1,9 @@
 """Prompts live in files, not in string literals scattered through the code.
 
-Three reasons, all of which show up in this project:
-
-1. The shared instructions (scope, refusal behaviour, language, citation style) are
-   identical for every agent. Duplicating them means fixing a refusal rule in four
-   places and missing one.
-2. A prompt is content, not logic. Editing prompts/*.txt to change the tutor's
-   behaviour needs no Python and produces a readable git diff.
-3. The Week 2 checkpoint asks for prompts/system_prompt.txt in the repository. It is
-   the same file the assistant actually runs on, not a copy that drifts out of date.
+The shared instructions (scope, refusal, language, citations) are identical for every
+agent, so they are composed rather than duplicated. Editing behaviour then needs no
+Python and produces a readable diff - and prompts/system_prompt.txt is the Week 2
+deliverable, running for real rather than a copy that drifts.
 """
 
 from __future__ import annotations

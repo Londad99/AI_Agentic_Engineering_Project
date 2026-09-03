@@ -1,29 +1,13 @@
-"""One entry point for every LLM call in the project.
+"""Single entry point for every LLM call: one retry policy, one output contract.
 
-No agent talks to Gemini directly. They all call `generate()` here, which means:
+Failures are classified rather than lumped together:
+  429 / quota  -> stop retrying; retrying cannot create quota.
+  5xx, timeout -> retry with backoff; Google's shared models spike and recover.
+  4xx          -> stop, wrapped with the API's own message; our config is wrong.
+  anything else-> re-raise raw; that is our bug and it must be loud.
 
-* the retry, timeout and fallback policy is written once, not four times;
-* switching model or provider is a one-line change instead of a hunt;
-* structured output works the same way on both backends, so an agent's Pydantic
-  contract holds no matter who answered.
-
-The fallback exists for a specific, real risk: the Gemini free tier is rate
-limited per minute and its shared models return 503 under load, while a live
-10-minute demo makes several calls in a row. If either hits mid-demo, the project
-can degrade to a local Qwen model through Ollama instead of dying.
-
-It is OFF by default (config.ENABLE_LOCAL_FALLBACK), because an 8B model on CPU
-is slow and turning it on while the agents are still being written just hides
-what we are trying to debug. Turn it on for the demo.
-
-The important discipline is *when* to fall back:
-
-  429 / RESOURCE_EXHAUSTED  -> immediately. Retrying cannot create quota.
-  5xx / network             -> retry Gemini with backoff first; fall back only
-                               after the retries are spent.
-  anything else             -> re-raise. A malformed prompt or a broken schema is
-                               our bug, and answering it with a weaker model would
-                               hide the bug behind a worse answer.
+The local Ollama fallback (config.ENABLE_LOCAL_FALLBACK, off by default) exists so a
+quota limit mid-demo degrades instead of dying.
 """
 
 from __future__ import annotations
@@ -89,6 +73,15 @@ def get_client() -> genai.Client:
 
         _client = genai.Client(api_key=config.require_api_key(), http_options=build_http_options())
     return _client
+
+
+def _is_daily_quota(error: Exception) -> bool:
+    """A per-day quota, not a per-minute one.
+
+    The distinction is everything: the same 429 carries a RetryInfo saying "retry in
+    2.5s", which is true for a per-minute limit and useless for a daily one.
+    """
+    return "PerDay" in str(error)
 
 
 def _is_rate_limit(error: Exception) -> bool:
@@ -219,6 +212,13 @@ def generate(
     # on the first call is a guard you cannot rely on.
     config.validate_models()
 
+    if config.LLM_PROVIDER == "ollama":
+        # Forced local: no Gemini attempt at all. With the daily quota spent, trying
+        # Gemini first would burn a minute per call to prove what we already know.
+        with step(f"{config.OLLAMA_MODEL} (local)"):
+            text = _call_ollama(prompt, system, schema, temperature)
+        return LLMResponse(text, "ollama", config.OLLAMA_MODEL)
+
     if allow_fallback is None:
         allow_fallback = config.ENABLE_LOCAL_FALLBACK
 
@@ -265,7 +265,7 @@ def generate(
         raise LLMError(
             f"{_explain(last_error)}\n\n"
             f"The local fallback is enabled but Ollama is unreachable at {config.OLLAMA_HOST}.\n"
-            f"Start it with `ollama serve`, or set config.ENABLE_LOCAL_FALLBACK=false in .env."
+            f"Start it with `ollama serve`, or set ENABLE_LOCAL_FALLBACK=false in .env."
         ) from error
 
 
@@ -315,9 +315,21 @@ def _explain(error: Exception | None) -> str:
             f"Original error: {error}"
         )
     if _is_rate_limit(error):
+        if _is_daily_quota(error):
+            return (
+                f"Daily free-tier quota exhausted for {config.GEMINI_MODEL}.\n"
+                f"The error also says 'retry in a few seconds' - ignore that. It is the per-minute\n"
+                f"RetryInfo attached to every 429; a daily quota resets tomorrow.\n\n"
+                f"Three ways forward:\n"
+                f"  1. Switch model - the quota is PER MODEL, so another has its own budget:\n"
+                f"       GEMINI_MODEL=gemini-3.5-flash-lite\n"
+                f"  2. Run locally for the rest of today:  LLM_PROVIDER=ollama\n"
+                f"  3. Stay on Gemini but degrade automatically:  ENABLE_LOCAL_FALLBACK=true\n\n"
+                f"Original error: {error}"
+            )
         return (
-            f"Gemini rate limit reached ({config.GEMINI_MODEL}). This is quota, not a bug in your code.\n"
-            f"Wait about a minute, or enable the local fallback with config.ENABLE_LOCAL_FALLBACK=true in .env.\n"
+            f"Per-minute rate limit on {config.GEMINI_MODEL}. Quota, not a bug in your code.\n"
+            f"Wait a minute and re-run, or set ENABLE_LOCAL_FALLBACK=true in .env.\n"
             f"Original error: {error}"
         )
     return (
@@ -327,18 +339,19 @@ def _explain(error: Exception | None) -> str:
         f"A 503 means the shared model is overloaded on Google's side - nothing is wrong with "
         f"your key or your code. Options:\n"
         f"  1. Re-run the cell in a minute; these spikes are usually short.\n"
-        f"  2. Pin a specific model in .env, e.g. config.GEMINI_MODEL=gemini-2.5-flash, instead of the\n"
+        f"  2. Pin a specific model in .env, e.g. GEMINI_MODEL=gemini-3.5-flash-lite, instead of the\n"
         f"     'latest' alias, which points at whichever build is busiest.\n"
-        f"  3. Set config.ENABLE_LOCAL_FALLBACK=true to answer from Ollama instead.\n"
+        f"  3. Set ENABLE_LOCAL_FALLBACK=true to answer from Ollama instead.\n"
         f"Original error: {error}"
     )
 
 
-def ollama_available() -> bool:
+def ollama_available(model: str | None = None) -> bool:
     """Used by the notebook to report honestly whether the fallback is armed."""
     try:
         response = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
         models = [m["name"] for m in response.json().get("models", [])]
-        return any(m.split(":")[0] == config.OLLAMA_MODEL.split(":")[0] for m in models)
+        wanted = (model or config.OLLAMA_MODEL).split(":")[0]
+        return any(m.split(":")[0] == wanted for m in models)
     except Exception:  # noqa: BLE001
         return False

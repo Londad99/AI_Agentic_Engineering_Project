@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ..config import DATA_DIR
 from ..errors import IngestionError
-from ..vectorstore import add_chunks, get_collection
+from ..vectorstore import add_chunks, collection_marker, get_collection
 from .chunker import chunk_pages
 from .cleaner import clean_pages
 from .pdf_loader import load_directory, load_pdf
@@ -48,8 +48,14 @@ def ingest(path: str | Path | None = None, reset: bool = False) -> dict:
     chunks = chunk_pages(cleaned)
 
     collection = get_collection()
-    if reset and collection.count():
-        collection.delete(where={"source": {"$ne": ""}})
+    if reset:
+        if collection.count():
+            collection.delete(where={"source": {"$ne": ""}})
+        # Forget which embedding model built the store, so --reset is also how you
+        # switch embedding providers.
+        marker = collection_marker()
+        if marker.exists():
+            marker.unlink()
 
     stored = add_chunks(chunks, collection=collection)
     return {

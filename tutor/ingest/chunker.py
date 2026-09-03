@@ -1,20 +1,9 @@
-"""Step 3 of ingestion: split cleaned pages into overlapping chunks.
+"""Split cleaned pages into overlapping chunks.
 
-Design decisions, and why:
-
-1. Characters, not tokens. Token-accurate chunking needs a tokenizer we do not
-   have for Gemini. ~4 chars per token in Spanish/English means CHUNK_SIZE=1200
-   is roughly 300 tokens, comfortably inside the embedding model's limit.
-
-2. Respect paragraph boundaries. Cutting mid-sentence produces a chunk whose
-   embedding represents half an idea, and a retrieved fragment the LLM cannot
-   use. We pack whole paragraphs until the budget is spent.
-
-3. Overlap. A concept explained across a paragraph boundary would otherwise be
-   invisible to both chunks. CHUNK_OVERLAP=200 chars carries the tail of the
-   previous chunk into the next one. Cost: ~15% more vectors stored.
-
-4. Never merge across pages, so page provenance stays exact.
+- Characters, not tokens: no tokenizer for Gemini, and ~1200 chars is ~300 tokens.
+- Respect paragraph boundaries: a chunk cut mid-sentence embeds half an idea.
+- 200-char overlap so a concept spanning two paragraphs is findable from both.
+- Never merge across pages, so page provenance stays exact.
 """
 
 from __future__ import annotations

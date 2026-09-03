@@ -167,6 +167,88 @@ def test_api_4xx_is_wrapped_not_buried():
         raise AssertionError("a 404 was answered by the fallback model")
 
 
+DAILY_429 = (
+    "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: generate_content_free_tier_requests, "
+    "limit: 20 ... 'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' ... "
+    "'retryDelay': '2s'"
+)
+MINUTE_429 = "429 RESOURCE_EXHAUSTED. 'quotaId': 'GenerateRequestsPerMinutePerProject-FreeTier'"
+
+
+def test_daily_quota_is_told_apart_from_per_minute():
+    """Both are 429 and both carry 'retry in 2s'. Only one of them means it.
+
+    A daily quota resets tomorrow, so 'wait a minute and re-run' is wrong advice that
+    costs the student an afternoon of retrying.
+    """
+    assert llm._is_daily_quota(Exception(DAILY_429))
+    assert not llm._is_daily_quota(Exception(MINUTE_429))
+
+    daily = llm._explain(FakeRateLimit(DAILY_429))
+    assert "resets tomorrow" in daily
+    assert "LLM_PROVIDER=ollama" in daily, "does not offer the local switch"
+    assert "PER MODEL" in daily, "does not mention that another model has its own quota"
+
+    minute = llm._explain(FakeRateLimit(MINUTE_429))
+    assert "Wait a minute" in minute and "resets tomorrow" not in minute
+    print("daily vs minute 429   OK")
+
+
+def test_forced_local_never_calls_gemini():
+    """LLM_PROVIDER=ollama must not touch Gemini at all.
+
+    With the daily quota spent, an attempt-then-fall-back would burn a minute of
+    retries per call to rediscover something we already know.
+    """
+    called = []
+
+    def gemini(*a):
+        called.append(1)
+        raise AssertionError("Gemini was called with LLM_PROVIDER=ollama")
+
+    llm._call_gemini, llm._call_ollama = gemini, lambda *a: "local answer"
+    original = llm.config.LLM_PROVIDER
+    try:
+        llm.config.LLM_PROVIDER = "ollama"
+        response = llm.generate("prompt")
+        assert response.provider == "ollama" and not called
+        print("forced local          OK")
+    finally:
+        llm.config.LLM_PROVIDER = original
+
+
+def test_invalid_provider_is_rejected():
+    from tutor import config
+    from tutor.errors import ConfigError
+
+    original = config.LLM_PROVIDER
+    try:
+        config.LLM_PROVIDER = "openai"
+        try:
+            config.validate_models()
+        except ConfigError as error:
+            assert "LLM_PROVIDER" in str(error)
+            print("bad provider caught   OK")
+        else:
+            raise AssertionError("an unknown provider was accepted")
+    finally:
+        config.LLM_PROVIDER = original
+
+
+def test_env_names_in_messages_are_real():
+    """Error messages must name the .env variable, not the Python attribute path.
+
+    A refactor once rewrote GEMINI_MODEL into config.GEMINI_MODEL everywhere, including
+    inside the strings telling the user what to put in .env - advice that cannot work.
+    """
+    import re
+
+    source = open(llm.__file__, encoding='utf-8').read()
+    for match in re.findall(r'config\.[A-Z_]+=', source):
+        raise AssertionError(f"message text tells the user to write {match!r} in .env")
+    print("env names in messages OK")
+
+
 def test_real_bug_is_not_hidden():
     def gemini(*a):
         raise TypeError("bad argument to generate_content")
@@ -300,6 +382,10 @@ if __name__ == "__main__":
     test_happy_path()
     test_rate_limit_falls_back()
     test_model_variables_are_validated()
+    test_daily_quota_is_told_apart_from_per_minute()
+    test_forced_local_never_calls_gemini()
+    test_invalid_provider_is_rejected()
+    test_env_names_in_messages_are_real()
     test_api_4xx_is_wrapped_not_buried()
     test_real_bug_is_not_hidden()
     test_httpx_timeout_is_transient()

@@ -1,9 +1,7 @@
-"""Step 1 of ingestion: PDF -> raw text, one record per page.
+"""PDF -> raw text, one record per page.
 
-We keep pages separate instead of concatenating the whole PDF into one string,
-because the page number is the only cheap provenance signal we get from a PDF.
-The exam generator has to cite a source chunk, and "page 14" is far more useful
-to a student than "chunk 37".
+Pages stay separate because the page number is the only cheap provenance a PDF gives
+us, and "page 14" is far more useful to a student than "chunk 37".
 """
 
 from __future__ import annotations

@@ -1,12 +1,10 @@
 """Progress output that actually shows up.
 
-Jupyter buffers stdout, so a plain print() during a long call is only flushed when
-the cell finishes - precisely when the user no longer needs it. Everything that
-takes time in this project reports through here, with flush=True.
+Jupyter buffers stdout, so a plain print during a long call is flushed only when the
+cell ends - exactly when it is no longer useful. Everything slow reports through here.
 
-Silence during a slow operation is a bug in its own right: the user cannot tell a
-working call from a hung one, and ends up interrupting the kernel halfway through
-an ingestion.
+Silence during a slow operation is its own bug: the user cannot tell a working call
+from a hung one, and interrupts the kernel halfway through an ingestion.
 """
 
 from __future__ import annotations

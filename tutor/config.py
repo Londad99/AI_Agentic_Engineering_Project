@@ -81,6 +81,17 @@ RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "5"))
 RETRY_BASE_DELAY = float(os.environ.get("RETRY_BASE_DELAY", "2"))
 RETRY_MAX_DELAY = float(os.environ.get("RETRY_MAX_DELAY", "16"))
 
+# Which provider answers. "auto" = Gemini, falling back to Ollama when Gemini is
+# unusable (only if ENABLE_LOCAL_FALLBACK). "gemini" / "ollama" force one, with no
+# attempt at the other - useful when the daily quota is spent and trying Gemini first
+# would just waste 60 seconds per call proving it.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "auto").strip().lower()
+
+# Same idea for embeddings. Switching this invalidates the vector store: vectors from
+# different models are not comparable, so the store must be rebuilt with --reset.
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "gemini").strip().lower()
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
 # Off while the project is being built: running an 8B model locally is slow and is
 # not what we are debugging right now. Flip it to true in .env once the agents work,
 # so the demo has a safety net against Gemini quota limits and outages.
@@ -119,6 +130,9 @@ def reload() -> dict:
     module["ENABLE_LOCAL_FALLBACK"] = os.environ.get(
         "ENABLE_LOCAL_FALLBACK", "false"
     ).strip().lower() in {"1", "true", "yes"}
+    module["LLM_PROVIDER"] = os.environ.get("LLM_PROVIDER", "auto").strip().lower()
+    module["EMBED_PROVIDER"] = os.environ.get("EMBED_PROVIDER", "gemini").strip().lower()
+    module["OLLAMA_EMBED_MODEL"] = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
     module["OLLAMA_MODEL"] = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
     module["OLLAMA_HOST"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
@@ -129,11 +143,24 @@ def reload() -> dict:
     llm._client = None
 
     return {
+        "LLM_PROVIDER": LLM_PROVIDER,
         "GEMINI_MODEL": GEMINI_MODEL,
         "GEMINI_EMBED_MODEL": GEMINI_EMBED_MODEL,
         "EMBED_DIM": EMBED_DIM,
         "ENABLE_LOCAL_FALLBACK": ENABLE_LOCAL_FALLBACK,
     }
+
+
+VALID_PROVIDERS = {"auto", "gemini", "ollama"}
+
+
+def active_chat_model() -> str:
+    """The model that will actually answer, for logging and error messages."""
+    return OLLAMA_MODEL if LLM_PROVIDER == "ollama" else GEMINI_MODEL
+
+
+def active_embed_model() -> str:
+    return OLLAMA_EMBED_MODEL if EMBED_PROVIDER == "ollama" else GEMINI_EMBED_MODEL
 
 
 def validate_models() -> None:
@@ -148,6 +175,14 @@ def validate_models() -> None:
     Cheap to check, and it turns a confusing 404 into a sentence that names the fix.
     """
     from .errors import ConfigError
+
+    if LLM_PROVIDER not in VALID_PROVIDERS:
+        raise ConfigError(f"LLM_PROVIDER must be one of {sorted(VALID_PROVIDERS)}, got {LLM_PROVIDER!r}.")
+    if EMBED_PROVIDER not in {"gemini", "ollama"}:
+        raise ConfigError(f"EMBED_PROVIDER must be 'gemini' or 'ollama', got {EMBED_PROVIDER!r}.")
+
+    if LLM_PROVIDER == "ollama":
+        return  # the Gemini model names are irrelevant when Gemini is not used
 
     if "embedding" in GEMINI_MODEL.lower():
         raise ConfigError(

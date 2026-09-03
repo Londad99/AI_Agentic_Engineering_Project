@@ -1,24 +1,14 @@
-"""Step 2 of ingestion: remove the noise a PDF extractor leaves behind.
+"""Remove the noise a PDF extractor leaves behind.
 
-Why this matters for RAG specifically: a repeated footer like
-"Universidad de Santander - 2026" appears on every page. If it survives into the
-chunks, it is embedded dozens of times, and any query that mentions the
-university retrieves near-identical garbage chunks that push out the real
-content. Cleaning is not cosmetic here, it directly protects retrieval quality.
+A footer repeated on every page gets embedded dozens of times and floods every result
+list with near-identical chunks, so cleaning protects retrieval quality directly.
 
-Strategy: instead of hardcoding patterns, detect lines that repeat across many
-pages (that is what a header/footer IS) and drop them. Repetition alone is not
-enough though: in a slide deck the same bullet can legitimately appear on many
-slides, and dropping it would delete real content. So we also require the line
-to be *positional* - among the first or last few lines of the page - which is
-where headers and footers live and where body text does not. We also require the
-line to not look like prose: sentence-final punctuation is the cheapest signal
-there is. "Universidad de Santander" is a footer; "Objetivo de la clase:
-comparar algoritmos." is content that happens to repeat.
+Boilerplate is detected by repetition AND position (page margins) AND not looking like
+prose - "Universidad de Santander" is a footer, "Objetivo de la clase: comparar
+algoritmos." is content that happens to repeat.
 
-Guiding principle when tuning these heuristics: a false negative leaves a little
-noise in the index, a false positive silently deletes material the student will
-be examined on. Always err toward keeping the line.
+Guiding principle: a false negative leaves noise in the index; a false positive
+silently deletes material the student will be examined on. Err toward keeping.
 """
 
 from __future__ import annotations
