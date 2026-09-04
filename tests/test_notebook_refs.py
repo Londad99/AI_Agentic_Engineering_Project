@@ -23,21 +23,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-NOTEBOOK = ROOT / "notebooks" / "tutor.ipynb"
+NOTEBOOKS = sorted((ROOT / "notebooks").glob("*.ipynb"))
 WATCHED = {"config", "llm", "embeddings", "embedding_cache", "progress", "vectorstore",
            "agents", "orchestrator", "prompts", "scoring", "grounding", "session"}
 
 
-def notebook_code_cells() -> list[tuple[int, str]]:
-    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+def notebook_code_cells() -> list[tuple[str, str]]:
+    """Every code cell of every notebook, labelled so a failure names the file."""
     cells = []
-    for index, cell in enumerate(notebook["cells"]):
-        if cell["cell_type"] != "code":
-            continue
-        source = "".join(cell["source"])
-        # Drop IPython magics (%pip, %autoreload): not valid Python syntax.
-        source = "\n".join(line for line in source.split("\n") if not line.lstrip().startswith("%"))
-        cells.append((index, source))
+    for path in NOTEBOOKS:
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        for index, cell in enumerate(notebook["cells"]):
+            if cell["cell_type"] != "code":
+                continue
+            source = "".join(cell["source"])
+            # Drop IPython magics (%pip, %autoreload): not valid Python syntax.
+            source = "\n".join(
+                line for line in source.split("\n") if not line.lstrip().startswith("%")
+            )
+            cells.append((f"{path.name}:{index}", source))
     return cells
 
 
@@ -55,8 +59,8 @@ def test_every_cell_parses():
         try:
             ast.parse(source)
         except SyntaxError as error:
-            raise AssertionError(f"cell {index} does not parse: {error}") from error
-    print("cells parse           OK")
+            raise AssertionError(f"{index} does not parse: {error}") from error
+    print(f"cells parse           OK ({len(NOTEBOOKS)} notebooks)")
 
 
 def test_attributes_exist():
@@ -95,9 +99,50 @@ def test_attributes_exist():
             if module_name not in modules:
                 continue
             if not hasattr(modules[module_name], node.attr):
-                missing.append(f"cell {index}: {module_name}.{node.attr}")
+                missing.append(f"{index}: {module_name}.{node.attr}")
     assert not missing, "notebook references attributes that do not exist:\n  " + "\n  ".join(missing)
     print(f"attributes resolve    OK ({len(modules)} modules checked)")
+
+
+def test_modules_are_imported_before_they_are_used():
+    """Catch a cell that uses `agents.x` when nothing in that notebook imported agents.
+
+    Moving cells between notebooks breaks exactly this way: the code is fine, the import
+    was three cells up in the file it came from, and the failure only shows when a human
+    runs the cell.
+    """
+    by_notebook: dict[str, list[tuple[str, str]]] = {}
+    for label, source in notebook_code_cells():
+        by_notebook.setdefault(label.split(":")[0], []).append((label, source))
+
+    problems = []
+    for notebook, cells in by_notebook.items():
+        imported: set[str] = set()
+        for label, source in cells:
+            tree = ast.parse(source)
+
+            # Record this cell's own imports first: importing and using a module in the
+            # same cell is normal, and flagging it would make the test useless.
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    imported.update(alias.asname or alias.name for alias in node.names)
+                elif isinstance(node, ast.Import):
+                    imported.update(
+                        (alias.asname or alias.name).split(".")[0] for alias in node.names
+                    )
+                elif isinstance(node, ast.Assign):
+                    imported.update(t.id for t in node.targets if isinstance(t, ast.Name))
+
+            used = {
+                node.value.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            }
+            for name in sorted(used & WATCHED):
+                if name not in imported:
+                    problems.append(f"{label}: uses {name}.* but it was never imported")
+    assert not problems, "notebook cells use modules they never import:\n  " + "\n  ".join(problems)
+    print("imports before use    OK")
 
 
 def test_front_ends_parse():
@@ -111,6 +156,7 @@ def test_front_ends_parse():
 
 if __name__ == "__main__":
     test_every_cell_parses()
+    test_modules_are_imported_before_they_are_used()
     test_front_ends_parse()
     test_attributes_exist()
     print("\nnotebook reference tests passed")

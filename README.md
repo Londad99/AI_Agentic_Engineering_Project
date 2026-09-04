@@ -9,7 +9,8 @@ practice exams grounded in the text, and grades written answers point by point.
 Built with **context engineering + RAG**, the **Gemini API** and **ChromaDB**, on a
 **sub-agent architecture**.
 
-**Start with [`notebooks/tutor.ipynb`](notebooks/tutor.ipynb)** — it walks through the
+**Start with [`notebooks/tutor.ipynb`](notebooks/tutor.ipynb)** (the RAG pipeline;
+the agents are in [`agents.ipynb`](notebooks/agents.ipynb)) — it walks through the
 whole system with its output committed, so it can be read on GitHub without running
 anything. The agents themselves live in `tutor/`, so the notebook and the chat program
 (`scripts/chat.py`) and the web app (`app.py`) are front ends over the same tested
@@ -145,6 +146,8 @@ python scripts/search.py "your question"  # check retrieval only
 python scripts/diagnose.py                # time each stage
 python scripts/bench.py                   # compare models on your key
 python scripts/check_ollama.py            # is the local model actually usable?
+python scripts/verify_search.py           # our cosine vs Chroma's index
+python scripts/compare_stores.py          # Chroma vs FAISS vs ours (needs faiss-cpu)
 ```
 
 ### Running on a local model
@@ -206,6 +209,36 @@ that failure is silent: nothing errors, the results are just quietly wrong.
 
 ---
 
+## Mapping to the Week 4 lab
+
+The lab notebook builds a RAG pipeline in phases. Each one has a home here:
+
+| Lab phase | Where |
+|---|---|
+| 0 · Corpus | `data/*.pdf` + `tutor/ingest/pdf_loader.py` — real PDFs, not a string |
+| 1 · Chunking | `tutor/ingest/chunker.py` — paragraph-aware, overlapping, content-hashed ids |
+| 2 · Indexing in ChromaDB | `tutor/vectorstore.py` — vectors with `source` / `page` metadata |
+| 2a · Comparison with FAISS | `scripts/compare_stores.py` — plus our own cosine as a third opinion |
+| 3 · `answer_with_rag` | `agents.answer_question()` — with two refusal gates |
+| Exercise 1 · your own documents | the whole project |
+| Exercise 2 · metadata filtering | `search(..., source="notes.pdf")` |
+
+Nothing here uses a high-level RAG framework. There is no LangChain, no LlamaIndex, no
+text splitter and no embedding wrapper: the chunking, the cleaning, the vector
+normalization, the cache and the citation check are all written directly against the
+Gemini SDK, ChromaDB and numpy.
+
+**Cosine similarity is implemented twice on purpose.** ChromaDB computes it inside its
+HNSW index; `tutor/vectormath.py` also computes it by hand. `scripts/verify_search.py`
+ranks the same query both ways and compares the orderings, because a misconfigured
+metric or unnormalized vectors would not raise an error — retrieval would just get
+quietly worse.
+
+```bash
+python scripts/verify_search.py     # our cosine vs Chroma's index
+python scripts/compare_stores.py    # adds FAISS (optional: pip install faiss-cpu)
+```
+
 ## Where RAG is used — and where it is not
 
 RAG is not applied uniformly. Each agent asks a different question, and only two of them
@@ -214,7 +247,7 @@ are retrieval questions.
 | Stage | RAG? | Query | Why |
 |---|---|---|---|
 | Ingestion | — | — | Deterministic transformation, no LLM at all. |
-| **Answerer** | **Yes** | the question itself | Plain Q&A, with a score floor: below it the document does not cover the question and the assistant says so. |
+| **Answerer** | **Yes** | the question itself, optionally scoped to one document | Plain Q&A, with a score floor: below it the document does not cover the question and the assistant says so. |
 | **Topic Extractor** | **No** | reads every chunk | Needs **coverage**; retrieval is built to discard most of the document. Opposite goals. |
 | **Exam Generator** | **Yes** | topic name + subtopics | "Which passages are about this topic?" is exactly a similarity question. |
 | **Grader** | **Yes** | question + the student's answer | Finds where the answer should come from *and* where the student's claims come from. |
@@ -316,7 +349,8 @@ progress.
 ## Layout
 
 ```
-notebooks/tutor.ipynb      the project: agents, orchestrator, demo
+notebooks/tutor.ipynb      the RAG pipeline, in the shape of the Week 4 lab
+notebooks/agents.ipynb     the agents built on top of it
 prompts/                   system_prompt.txt (shared persona) + one file per agent
                            (answerer, topic_extractor, exam_generator, grader, router)
 tutor/config.py            settings from .env; config.reload() re-reads them live
@@ -328,11 +362,12 @@ tutor/grounding.py         verifies a quoted sentence exists in the source
 tutor/scoring.py           derives the score from per-criterion verdicts
 tutor/session.py           study state (typed) + conversation memory
 tutor/library.py           the PDFs on disk: listing, archiving, restoring
+tutor/vectormath.py        cosine similarity and ranking, written by hand
 tutor/prompts.py           loads prompts/*.txt, composes persona + role
 tutor/agents.py            the three specialists: topics, exam, grading
 tutor/orchestrator.py      routing and dispatch
 app.py                     Streamlit front end (rendering only, no agent logic)
-tutor/ingest/              pdf_loader -> cleaner -> chunker -> pipeline
+tutor/ingest.py            PDF -> clean -> chunk -> embed -> store (4 sections)
 tests/                     offline tests; no API key, no network
 scripts/                   ingest.py, search.py, bench.py, diagnose.py
 data/                      your PDFs (git-ignored); _removed/ holds detached ones
@@ -354,5 +389,7 @@ python tests/test_prompts.py        # the shared persona reaches every agent
 python tests/test_orchestrator.py   # routing and dispatch, with fake agents
 python tests/test_progress.py       # progress sinks used by the UI
 python tests/test_library.py        # archiving never destroys a document
+python tests/test_vectormath.py     # the hand-written cosine, against its definition
+python tests/test_notebook_chunker.py  # the notebook's chunker matches the module's
 python tests/test_notebook_refs.py  # notebook cells reference things that exist
 ```

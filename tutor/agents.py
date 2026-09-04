@@ -155,7 +155,8 @@ class GroundedAnswer(BaseModel):
     source_pages: list[int] = Field(description="pages the answer comes from")
 
 
-def answer_question(question: str, top_k: int = RETRIEVAL_K) -> tuple[GroundedAnswer, list[dict]]:
+def answer_question(question: str, top_k: int = RETRIEVAL_K,
+                    source: str | None = None) -> tuple[GroundedAnswer, list[dict]]:
     """Answer from the document, or say plainly that the document does not cover it.
 
     Declining is a feature, not a fallback. A student revising for an exam is harmed
@@ -171,16 +172,17 @@ def answer_question(question: str, top_k: int = RETRIEVAL_K) -> tuple[GroundedAn
          answer, so the schema forces an explicit answered=true/false rather than
          letting a hedge ("the document suggests...") pass for an answer.
     """
-    hits = search(question, top_k=top_k)
+    hits = search(question, top_k=top_k, source=source)
     best = max((h["score"] for h in hits), default=0.0)
 
     if not hits or best < ANSWER_THRESHOLD:
         status(f"  no passage above {ANSWER_THRESHOLD:.2f} (best {best:.2f}) - declining")
+        scope = f" in {source}" if source else ""
         return (
             GroundedAnswer(
                 answered=False,
                 answer="",
-                missing="Nothing in the indexed document is close to this question.",
+                missing=f"Nothing{scope} is close to this question.",
                 source_pages=[],
             ),
             hits,

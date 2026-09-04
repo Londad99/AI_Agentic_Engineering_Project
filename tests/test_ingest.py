@@ -10,9 +10,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tutor.ingest.chunker import chunk_pages  # noqa: E402
-from tutor.ingest.cleaner import clean_pages  # noqa: E402
-from tutor.ingest.pdf_loader import Page  # noqa: E402
+from tutor.ingest import chunk_pages  # noqa: E402
+from tutor.ingest import clean_pages  # noqa: E402
+from tutor.ingest import Page  # noqa: E402
 
 HEADER = "Universidad de Santander - Facultad de Ingenierias"
 FOOTER = "Algoritmos y Estructuras de Datos - 2026"

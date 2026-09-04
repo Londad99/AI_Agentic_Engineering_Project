@@ -15,7 +15,7 @@ import numpy as np
 from google import genai
 from google.genai import types
 
-from . import embedding_cache
+from . import embedding_cache, vectormath
 from . import config
 from .progress import status, step
 
@@ -60,10 +60,8 @@ def build_http_options() -> types.HttpOptions:
 
 
 def _normalize(vector: list[float]) -> list[float]:
-    """Required when output_dimensionality != 3072: Google only normalizes the full-size output."""
-    array = np.array(vector, dtype=np.float32)
-    norm = np.linalg.norm(array)
-    return (array / norm).tolist() if norm else array.tolist()
+    """Delegates to tutor.vectormath so there is one implementation, not two."""
+    return vectormath.normalize(vector)
 
 
 def _call_ollama_embed(texts: list[str]) -> list[list[float]]:

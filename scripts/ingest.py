@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tutor.errors import TutorError  # noqa: E402
-from tutor.ingest.pipeline import ingest  # noqa: E402
+from tutor.ingest import ingest  # noqa: E402
 
 parser = argparse.ArgumentParser(description="Ingest PDFs into ChromaDB.")
 parser.add_argument("path", nargs="?", default=None, help="PDF file or folder (default: data/)")

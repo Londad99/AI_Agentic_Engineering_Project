@@ -14,7 +14,8 @@ import chromadb
 from . import config
 from .config import CHROMA_COLLECTION, STORAGE_DIR
 from .embeddings import embed_documents, embed_query
-from .ingest.chunker import Chunk
+from .ingest import Chunk
+from . import vectormath
 from .progress import status, step
 
 _client: chromadb.ClientAPI | None = None
@@ -142,8 +143,57 @@ def list_all_chunks(collection=None) -> list[dict]:
     return chunks
 
 
-def search(query: str, top_k: int = 5, threshold: float | None = None, collection=None) -> list[dict]:
-    """Semantic search. Same idea as the week-3 notebook, backed by a real vector DB.
+def brute_force_search(query: str, top_k: int = 5, threshold: float | None = None,
+                       source: str | None = None, collection=None) -> list[dict]:
+    """The same search, ranked by our own code instead of Chroma's index.
+
+    Pulls every vector out of the store and scores it with tutor.vectormath. O(n) and
+    fine for a few hundred chunks; the point is not speed, it is having a second,
+    independent implementation to check the first against.
+    """
+    collection = collection or get_collection()
+    if collection.count() == 0:
+        return []
+    stored = collection.get(
+        where={"source": source} if source else None,
+        include=["documents", "metadatas", "embeddings"],
+    )
+    ranked = vectormath.rank(embed_query(query), stored["embeddings"], top_k=top_k,
+                             threshold=threshold)
+    return [
+        {"text": stored["documents"][i], "metadata": stored["metadatas"][i], "score": score}
+        for i, score in ranked
+    ]
+
+
+def compare_backends(query: str, top_k: int = 5, collection=None) -> dict:
+    """Rank the same query both ways and report whether the orderings agree.
+
+    A disagreement means the store is not doing what we think - the wrong metric, or
+    vectors that were never normalized. Neither of those raises an error on its own:
+    the results just get quietly worse, which is the hardest kind of bug to notice.
+    """
+    collection = collection or get_collection()
+    theirs = search(query, top_k=top_k, collection=collection)
+    ours = brute_force_search(query, top_k=top_k, collection=collection)
+
+    def key(hit):
+        return (hit["metadata"].get("source"), hit["metadata"].get("page"),
+                hit["metadata"].get("chunk_index"))
+
+    same_order = [key(h) for h in theirs] == [key(h) for h in ours]
+    biggest_gap = max(
+        (abs(a["score"] - b["score"]) for a, b in zip(theirs, ours)), default=0.0
+    )
+    return {"chroma": theirs, "ours": ours, "same_order": same_order,
+            "max_score_difference": biggest_gap}
+
+
+def search(query: str, top_k: int = 5, threshold: float | None = None,
+           source: str | None = None, collection=None) -> list[dict]:
+    """Semantic search, optionally restricted to one source document.
+
+    Same idea as the week-3 notebook, backed by a real vector DB.
 
     Chroma returns cosine *distance* (0 = identical). We convert to the similarity
     score the notebook used, so `threshold` means the same thing it did there.
@@ -155,9 +205,13 @@ def search(query: str, top_k: int = 5, threshold: float | None = None, collectio
         return []
     vector = embed_query(query)
     with step(f"searching {total} chunks"):
-        result = collection.query(
+            result = collection.query(
             query_embeddings=[vector],
             n_results=min(top_k, total),
+            # Metadata filter: restrict retrieval to one document. Chroma applies it
+            # BEFORE the vector search, so top_k is filled from the matching subset
+            # instead of being filtered down to two results afterwards.
+            where={"source": source} if source else None,
             include=["documents", "metadatas", "distances"],
         )
     hits = []

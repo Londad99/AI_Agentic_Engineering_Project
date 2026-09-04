@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tutor import config  # noqa: E402
 from tutor.errors import TutorError  # noqa: E402
-from tutor.ingest.pipeline import ingest  # noqa: E402
+from tutor.ingest import ingest  # noqa: E402
 from tutor.orchestrator import handle  # noqa: E402
 from tutor.session import StudySession  # noqa: E402
 from tutor.vectorstore import get_collection  # noqa: E402
